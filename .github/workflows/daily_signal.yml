@@ -1,4 +1,4 @@
-name: B1-木星 每日信号更新
+name: B4-动量止损 每日信号更新
 
 on:
   schedule:
@@ -34,13 +34,13 @@ jobs:
           pip install --only-binary=:all: baostock pandas numpy matplotlib
           pip install akshare --no-deps
 
-      - name: 生成信号页面
-        run: python signal_page/generate.py
+      - name: 生成B4信号页面
+        run: python signal_page_b4/generate.py
 
       - name: 上传 Pages 制品
         uses: actions/upload-pages-artifact@v3
         with:
-          path: signal_page/docs
+          path: signal_page_b4/docs
 
   deploy:
     runs-on: ubuntu-latest
