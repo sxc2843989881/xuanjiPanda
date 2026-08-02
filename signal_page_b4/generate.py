@@ -2,7 +2,7 @@
 本脚本完全自包含，可直接在 GitHub Actions 上运行。
 依赖: pip install baostock pandas numpy matplotlib akshare
 """
-import os, base64, io, json, warnings, argparse, time, sys
+import os, base64, io, json, warnings, argparse, time
 from datetime import datetime, timedelta, timezone
 
 BEIJING_TZ = timezone(timedelta(hours=8))
@@ -15,7 +15,7 @@ import pandas as pd
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
-import matplotlib.dates as mdates
+
 warnings.filterwarnings('ignore')
 
 # ========== B4策略配置 ==========
@@ -260,68 +260,17 @@ def compute_signals(g_close, v_close, params):
     return df
 
 
-# ========== P&L 计算 ==========
-def calc_nav(df, g_close, v_close):
-    """计算策略净值曲线"""
-    da = g_close.reindex(df.index).ffill()
-    db = v_close.reindex(df.index).ffill()
-    daily_g_ret = da.pct_change()
-    daily_v_ret = db.pct_change()
-    TRADE_COST = 0.0001
-    IMPACT_COST = 0.0005
-    TOTAL_COST = TRADE_COST + IMPACT_COST
-    INIT_CAP = 10000
 
-    nav = pd.Series(INIT_CAP, index=df.index)
-    strat_ret = pd.Series(0.0, index=df.index)
-    for i in range(1, len(df)):
-        ps = df.iloc[i - 1]
-        cs = df.iloc[i]
-        cost = 0.0
-        if ps['dir'] != cs['dir'] or abs(ps['wt'] - cs['wt']) > 0.01:
-            cost = TOTAL_COST * 2
-        if ps['wt'] > 0 and ps['dir'] == 'growth':
-            strat_ret.iloc[i] = daily_g_ret.iloc[i] * ps['wt'] - cost
-        elif ps['wt'] > 0 and ps['dir'] == 'value':
-            strat_ret.iloc[i] = daily_v_ret.iloc[i] * ps['wt'] - cost
-        else:
-            strat_ret.iloc[i] = -cost
-        nav.iloc[i] = nav.iloc[i - 1] * (1 + strat_ret.iloc[i])
-    return nav, INIT_CAP
 
 
 # ========== 图表生成 ==========
-def make_chart(df, nav=None):
-    """4子图：P&L → 比价+MA20 → T值 → 仓位"""
-    n_rows = 4 if nav is not None else 3
-    ratios = [1.5, 2, 1, 1] if nav is not None else [2, 1, 1]
-    fig, axes = plt.subplots(n_rows, 1, figsize=(12, 8),
-                             gridspec_kw={'height_ratios': ratios})
-
-    if nav is not None:
-        ax = axes[0]
-        nav_show = nav.tail(30)
-        init_val = nav_show.iloc[0] if len(nav) > 30 else nav.iloc[0]
-        ax.plot(nav_show.index, nav_show.values, color='#E74C3C', lw=2)
-        ax.fill_between(nav_show.index, init_val, nav_show.values,
-                        color='#E74C3C', alpha=0.15)
-        ax.axhline(init_val, color='gray', ls=':', lw=0.8)
-        ax.annotate(f'{nav_show.iloc[-1]:.0f}',
-                    xy=(nav_show.index[-1], nav_show.iloc[-1]),
-                    fontsize=11, fontweight='bold', color='#E74C3C',
-                    va='bottom', ha='left')
-        pnl_pct = (nav_show.iloc[-1] / init_val - 1) * 100
-        ax.set_title(f'P&L (10,000 start)  Now {nav_show.iloc[-1]:.0f}  ({pnl_pct:+.2f}%)',
-                     fontsize=11, fontweight='bold')
-        ax.set_ylabel('P&L (CNY)', fontsize=9)
-        ax.xaxis.set_major_formatter(mdates.DateFormatter('%m-%d'))
-        plt.setp(ax.xaxis.get_majorticklabels(), rotation=45, ha='right', fontsize=6)
-        ax.grid(alpha=0.2)
-
-    ax_next = 1 if nav is not None else 0
+def make_chart(df):
+    """3子图：比价+MA20 → T值 → 仓位（仅信号，不回测P&L）"""
+    fig, axes = plt.subplots(3, 1, figsize=(12, 8),
+                             gridspec_kw={'height_ratios': [2, 1, 1]})
     dates = df.index[-120:]
 
-    ax = axes[ax_next]
+    ax = axes[0]
     ax.plot(dates, df.loc[dates, 'ratio'], color='#333333', lw=1.5, label='GV Ratio')
     ax.plot(dates, df.loc[dates, 'ma20'], color='#E74C3C', ls='--', lw=1, label='MA20')
     ax.axhline(1.0, color='gray', ls=':', alpha=0.4)
@@ -342,7 +291,7 @@ def make_chart(df, nav=None):
     if last_dir is not None and start_d is not None:
         ax.axvspan(start_d, dates[-1], alpha=0.08, color=dir_colors.get(last_dir, '#CCC'))
 
-    ax = axes[ax_next + 1]
+    ax = axes[1]
     ax.plot(dates, df.loc[dates, 'T'], color='#3498DB', lw=1.5, label='T(z-score)')
     ax.axhline(0, color='gray', ls='-', lw=0.5)
     ax.axhline(1.3, color='#E74C3C', ls='--', lw=0.8, label='+rt=1.3')
@@ -352,7 +301,7 @@ def make_chart(df, nav=None):
     ax.legend(fontsize=8, loc='upper left')
     ax.grid(alpha=0.2)
 
-    ax = axes[ax_next + 2]
+    ax = axes[2]
     ax.fill_between(dates, 0, df.loc[dates, 'wt'], color='#9B59B6', alpha=0.4, step='mid')
     ax.plot(dates, df.loc[dates, 'wt'], color='#9B59B6', lw=1, drawstyle='steps-post')
     ax.set_ylabel('Position', fontsize=9)
@@ -393,9 +342,6 @@ def make_html(signal, df, chart_b64, trades=None, params=None):
     last10['wt_label'] = last10['wt'].apply(
         lambda w: '空仓' if w == 0 else f'{w * 100:.0f}%')
 
-    def fmt(val, digits=2):
-        return f'{val:.{digits}f}'
-
     return f'''<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -431,7 +377,7 @@ def make_html(signal, df, chart_b64, trades=None, params=None):
   .charts {{ margin-bottom: 12px; }}
   .charts img {{ width: 100%; border-radius: 12px; box-shadow: 0 2px 8px rgba(0,0,0,0.06); }}
 
-  .grid {{ display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 10px; margin-bottom: 12px; }}
+  .grid {{ display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 12px; }}
   .stat-card {{ background: white; border-radius: 12px; padding: 14px 10px;
     box-shadow: 0 2px 8px rgba(0,0,0,0.06); text-align: center; }}
   .stat-card .num {{ font-size: 26px; font-weight: 700; color: #2c3e50; }}
@@ -466,7 +412,7 @@ def make_html(signal, df, chart_b64, trades=None, params=None):
   @media (max-width: 600px) {{
     .signal-main {{ flex-direction: column; align-items: stretch; }}
     .signal-badge {{ width: 100%; }}
-    .grid {{ grid-template-columns: 1fr 1fr 1fr; }}
+    .grid {{ grid-template-columns: 1fr 1fr; }}
     .header h1 {{ font-size: 15px; }}
     body {{ padding: 8px; }}
     .advice-card .text {{ font-size: 16px; }}
@@ -525,11 +471,6 @@ def make_html(signal, df, chart_b64, trades=None, params=None):
     <div class="stat-card">
       <div class="num">{t60_mean:.2f}</div>
       <div class="lbl">T均值(60天)</div>
-    </div>
-    <div class="stat-card">
-      <div class="num" style="color:{'#E74C3C' if latest.get('pnl_pct',0) >= 0 else '#2ECC71'}">
-        {latest.get('nav', 0):.0f}</div>
-      <div class="lbl">账户净值(¥){latest.get('pnl_pct', 0):+.2f}%</div>
     </div>
     <div class="stat-card">
       <div class="num" style="font-size:22px">{latest.get('latest_date','')}</div>
@@ -605,14 +546,7 @@ def main():
     print('\n🧮 计算信号 (B4 6层逻辑)...')
     df = compute_signals(g, v, B4_PARAMS)
 
-    # 3. 计算P&L
-    print('\n💰 计算策略净值...')
-    nav, INIT_CAP = calc_nav(df, g, v)
-    current_nav = nav.iloc[-1]
-    pnl_pct = (current_nav / INIT_CAP - 1) * 100
-    print(f'  初始资金: {INIT_CAP}  →  当前: {current_nav:.2f}  ({pnl_pct:+.2f}%)')
-
-    # 4. 最新信号
+    # 3. 最新信号
     last = df.iloc[-1]
     prev = df.iloc[-2] if len(df) >= 2 else last
     dir_now = last['dir']
@@ -634,7 +568,7 @@ def main():
         hold_text = '买入' if wt_now >= 1.0 else '持有'
         advice = f'{hold_text} {target}，仓位 {wt_now * 100:.0f}%'
 
-    # 5. 调仓记录
+    # 4. 调仓记录
     trades = []
     dir_map = {'growth': NAME_G, 'value': NAME_V, 'cash': '空仓'}
     for i in range(1, len(df)):
@@ -658,24 +592,21 @@ def main():
         'dev_pct': last['dev'] * 100,
         'target': target,
         'advice': advice,
-        'nav': current_nav,
-        'pnl_pct': pnl_pct,
-        'init_cap': INIT_CAP,
         'latest_date': df.index[-1].strftime('%m-%d'),
     }
 
     print(f'\n  📊 最新信号: {latest["dir"]}  仓位: {latest["wt"] * 100:.0f}%  '
-          f'T={last["T"]:+.3f}  NAV={current_nav:.0f}')
+          f'T={last["T"]:+.3f}')
 
-    # 6. 生成图表
-    print('\n📈 生成图表...')
-    chart_b64 = make_chart(df, nav)
+    # 5. 生成图表（仅信号，不回测P&L）
+    print('\n📈 生成信号图表...')
+    chart_b64 = make_chart(df)
 
-    # 7. 生成HTML
+    # 6. 生成HTML
     print('\n📄 生成HTML信号页面...')
     html = make_html(latest, df, chart_b64, trades, B4_PARAMS)
 
-    # 8. 输出
+    # 7. 输出
     script_dir = os.path.dirname(os.path.abspath(__file__))
     out_dir = args.out_dir if args.out_dir else os.path.join(script_dir, 'docs')
     os.makedirs(out_dir, exist_ok=True)
@@ -698,8 +629,6 @@ def main():
             'T_value': float(last['T']),
             'slope': float(last['slope']),
             'deviation_pct': float(last['dev'] * 100),
-            'nav': float(current_nav),
-            'pnl_pct': float(pnl_pct),
             'advice': advice,
         },
         'recent_signals': [
