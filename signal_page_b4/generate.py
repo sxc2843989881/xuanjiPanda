@@ -173,7 +173,7 @@ def compute_signals(g_close, v_close, params):
         else:
             new_dir.iloc[i] = prev
     dir_raw = new_dir.ffill().fillna('growth')
-    dir_series = dir_raw.map({'growth': 'growth', 'BEAR': 'value'})
+    dir_series = dir_raw.map({'growth': 'growth', 'value': 'value'})
 
     # 权重初始为1.0
     wt = pd.Series(1.0, index=index)
@@ -549,8 +549,8 @@ def main():
     # 3. 最新信号
     last = df.iloc[-1]
     prev = df.iloc[-2] if len(df) >= 2 else last
-    dir_now = last['dir']
-    dir_prev = prev['dir']
+    dir_now = last['dir'] if pd.notna(last['dir']) else 'cash'
+    dir_prev = prev['dir'] if pd.notna(prev['dir']) else 'cash'
     wt_now = last['wt']
     wt_prev = prev['wt']
 
