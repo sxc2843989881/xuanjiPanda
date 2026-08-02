@@ -1,0 +1,54 @@
+name: B1-木星 每日信号更新
+
+on:
+  schedule:
+    # 交易日北京时间 15:30 运行（收盘后30分钟）
+    - cron: '30 7 * * 1-5'
+  workflow_dispatch:  # 手动触发
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pandaai-signal-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 设置 Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: 安装依赖
+        run: |
+          pip install --only-binary=:all: baostock pandas numpy matplotlib
+          pip install akshare --no-deps
+
+      - name: 生成信号页面
+        run: python signal_page/generate.py
+
+      - name: 上传 Pages 制品
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: signal_page/docs
+
+  deploy:
+    runs-on: ubuntu-latest
+    needs: build
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: 部署到 GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

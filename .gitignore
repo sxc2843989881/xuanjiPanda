@@ -1,0 +1,68 @@
+# ===== Python =====
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+*.egg
+dist/
+build/
+
+# ===== 环境 =====
+.env
+venv/
+.venv/
+env/
+
+# ===== MongoDB 数据 =====
+mongodb/data/
+mongodb/clean_data/data/
+mongodb/temp_data/
+mongodb/temp_27018/
+mongodb/**/diagnostic.data/
+mongodb/**/journal/
+mongodb/**/WiredTiger*
+mongodb/**/_mdb_catalog.wt
+mongodb/**/mongod.lock
+mongodb/**/sizeStorer.wt
+mongodb/**/storage.bson
+mongodb/**/mongod.log
+mongodb/**/mongod*.log
+mongodb/**/*.wt
+mongodb/mongod.exe
+mongodb/bin/mongod.exe
+mongodb/mongo.key
+
+# ===== 日志 =====
+*.log
+panda_quantflow/src/logs/
+panda_quantflow/src/panda_backtest/logs/
+
+# ===== 数据文件 =====
+**/df_factors/*.csv
+**/results/*.csv
+**/data_cache/*.csv
+research/**/*.csv
+research/**/*.json
+research/**/*.txt
+
+# ===== IDE =====
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ===== OS =====
+.DS_Store
+Thumbs.db
+
+# ===== 模型文件 =====
+*.model
+*.json
+!panda_quantflow/src/panda_plugins/internal/models/common_models.py
+!panda_quantflow/src/panda_plugins/internal/models/xgboost_model_*.json
+
+# ===== 信号页面 =====
+signal_page/docs/signal.json
+signal_page/docs/t_history.png
