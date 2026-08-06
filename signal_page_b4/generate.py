@@ -1,6 +1,18 @@
-"""B4-动量止损版 成长价值轮动策略 — 每日信号生成器
+"""B4V2-动态牛市止损版 成长价值轮动策略 — 每日信号生成器
 本脚本完全自包含，可直接在 GitHub Actions 上运行。
 依赖: pip install baostock pandas numpy matplotlib akshare
+
+B4V2 = B3 + 第5层(动态牛市止损·斐波那契阶梯解锁) + 第8层(黑天鹅保护·固定10日动量解锁)
+
+第5层改进（B4V2核心）：
+  仅保留超级牛市（涨幅>50%）触发止损，采用斐波那契阶梯解锁：
+  - 滚动65日窗口找牛市起点Low，从Low到当前价计算涨幅
+  - 触发条件：当前价从Low涨幅>50% + 5日动量转负
+  - 基准锁定天数 = min(rise_days, 65)
+  - 双路径解锁：
+    路径A：突破Peak新高 → 立即解锁（试错机制）
+    路径B：斐波那契阶梯解锁
+      回撤0.782→锁定减半，回撤0.9→立即完全解锁
 """
 import os, base64, io, json, warnings, argparse, time
 from datetime import datetime, timedelta, timezone
@@ -18,14 +30,14 @@ import matplotlib.pyplot as plt
 
 warnings.filterwarnings('ignore')
 
-# ========== B4策略配置 ==========
+# ========== B4V2策略配置 ==========
 CODE_G = '159259'   # 易方达成长ETF
 CODE_V = '159263'   # 易方达价值ETF
 NAME_G = '易方达成长ETF'
 NAME_V = '易方达价值ETF'
 FETCH_DAYS = 500    # 拉取天数
 
-# B4策略核心参数（与backtest params.py BASELINE_PARAMS 一致）
+# B4V2策略核心参数（与 strategies/growth_value_rotation_b4v2/params.py BASELINE_PARAMS 一致）
 B4_PARAMS = dict(
     dc=5,                # 方向确认天数
     dcd=6,               # 方向冷却天数
@@ -33,10 +45,10 @@ B4_PARAMS = dict(
     slope_thresh=0.002,  # 弱斜率阈值
     bias_high=0.19,      # BIAS超买阈值
     bias_mode='clear',
-    # 第5层：牛市高点止损
-    mom_60d_period=60,
-    mom_3m_thresh=0.50,
-    mom_5d_lock=60,
+    # 第5层：动态牛市止损 — 斐波那契阶梯解锁（B4V2改进）
+    l5_lookback_window=65,      # 滚动窗口找牛市起点Low
+    l5_min_rise=0.50,           # 最低触发涨幅：仅保留超级牛市，涨幅>50%才触发
+    l5_big_bull_thresh=0.50,    # 超级牛市阈值：涨幅>50%用严格阶梯
     # 第8层：黑天鹅保护
     black_swan_g_thresh=0.06,
     black_swan_v_thresh=0.03,
@@ -120,17 +132,62 @@ def fetch_akshare(code, name, days=500):
         raise ValueError(f'{name}: baostock和akshare均无数据')
 
 
-# ========== B4策略 6层信号计算 ==========
-def compute_signals(g_close, v_close, params):
-    """B4-动量止损版 6层信号计算
+# ========== B4V2 辅助函数 ==========
+def _calc_low_peak_rise(g_close, lookback_window):
+    """预计算每个交易日的Low、Peak、peak_rise_pct、current_rise_pct、rise_days
 
-    B4 = B3 + 第5层(牛市高点止损·新高可解锁) + 第8层(黑天鹅保护·固定10日动量解锁)
+    滚动窗口内找最低价Low，再从Low到当前找最高价Peak。
+
+    Args:
+        g_close: 收盘价Series
+        lookback_window: 滚动窗口大小
+
+    Returns:
+        low_series: 每个交易日的Low
+        peak_series: 每个交易日从Low到当前的最高价
+        peak_rise_pct_series: 涨幅 = Peak/Low - 1（用于区分大小牛市）
+        current_rise_pct_series: 涨幅 = 当前价/Low - 1（用于触发条件）
+        rise_days_series: 从Low到当前的天数
+    """
+    n = len(g_close)
+    index = g_close.index
+    low_series = pd.Series(index=index, dtype=float)
+    peak_series = pd.Series(index=index, dtype=float)
+    peak_rise_pct_series = pd.Series(index=index, dtype=float)
+    current_rise_pct_series = pd.Series(index=index, dtype=float)
+    rise_days_series = pd.Series(index=index, dtype=int)
+
+    for i in range(n):
+        start = max(0, i - lookback_window + 1)
+        window = g_close.iloc[start:i + 1]
+        low_val = window.min()
+        low_idx = window.idxmin()
+        current_val = g_close.iloc[i]
+        peak_val = g_close.loc[low_idx:g_close.index[i]].max()
+        # 交易日数（从Low到当前的数据行数-1）
+        rise_days = len(g_close.loc[low_idx:g_close.index[i]]) - 1
+
+        low_series.iloc[i] = low_val
+        peak_series.iloc[i] = peak_val
+        peak_rise_pct_series.iloc[i] = peak_val / low_val - 1
+        current_rise_pct_series.iloc[i] = current_val / low_val - 1
+        rise_days_series.iloc[i] = rise_days
+
+    return low_series, peak_series, peak_rise_pct_series, current_rise_pct_series, rise_days_series
+
+
+# ========== B4V2策略 6层信号计算 ==========
+def compute_signals(g_close, v_close, params):
+    """B4V2-动态牛市止损版 6层信号计算
+
+    B4V2 = B3 + 第5层(动态牛市止损·斐波那契阶梯解锁) + 第8层(黑天鹅保护·固定10日动量解锁)
 
     第1层 DC   — 方向确认：T值方向需连续 dc 天一致才确认
     第2层 DCD  — 方向冷却：换向后需等 dcd 天才允许再次换向
     第3层 弱信号 — T弱+斜率弱 → 空仓
     第4层 BIAS — 超买保护：偏离MA20>bias_high → 清仓
-    第5层 牛市高点止损 — 持有成长时，60日动量>50%+5日动量转负 → 清仓成长，锁定60天
+    第5层 动态牛市止损 — 滚动65日窗口找Low，当前价从Low涨幅>50%+5日动量转负 → 触发止损
+          双路径解锁：新高立即解锁 + 斐波那契阶梯(0.782减半/0.9完全解锁)
     第8层 黑天鹅保护 — 5日内成长跌>6%且价值跌>3% → 全部空仓，固定10日动量解锁
     """
     # 比价 = 成长/价值
@@ -191,29 +248,103 @@ def compute_signals(g_close, v_close, params):
     extreme_v = (dir_series == 'value') & (v_bias > params.get('bias_high', 0.19))
     wt[extreme_g | extreme_v] = 0.0
 
-    # ===== L5: 牛市高点止损 =====
-    g_mom_60d = g_close / g_close.shift(params.get('mom_60d_period', 60)) - 1
+    # ===== L5: 动态牛市止损 — 斐波那契阶梯解锁（B4V2改进）=====
+    lookback_window = params.get('l5_lookback_window', 65)
+    min_rise = params.get('l5_min_rise', 0.50)
+    big_bull_thresh = params.get('l5_big_bull_thresh', 0.50)
+
+    # 预计算每个交易日的Low、Peak、peak_rise_pct、current_rise_pct、rise_days
+    g_low_series, g_peak_series, g_peak_rise_pct, g_current_rise_pct, g_rise_days = \
+        _calc_low_peak_rise(g_close, lookback_window)
+
+    # 5日动量
     g_mom_5d = g_close / g_close.shift(5) - 1
-    g_high_60d = g_close.rolling(params.get('mom_60d_period', 60)).max()
+
+    # 触发条件：持有成长 + 当前价从Low涨幅>min_rise + 5日动量转负
     growth_high_mom = (
         (dir_series == 'growth')
-        & (g_mom_60d > params.get('mom_3m_thresh', 0.50))
+        & (g_current_rise_pct > min_rise)
         & (g_mom_5d < 0)
     )
-    growth_locked_until = -1
-    growth_trigger_peak = None
+
+    # 顺序追踪成长锁定状态
+    growth_locked_until = -1       # 锁定的结束索引（绝对index）
+    growth_lock_start = -1         # 触发锁定的起始索引
+    growth_trigger_peak = None     # 触发时的Peak价（新高解锁基准）
+    growth_trigger_low = None      # 触发时的Low价
+    growth_trigger_peak_rise_pct = None  # 触发时的Peak/Low涨幅（区分大小牛市阶梯）
+    growth_base_lock = 0           # 基准锁定天数
+
     for i in range(n):
+        current_price = g_close.iloc[i]
+
+        # ===== 检查解锁 =====
         if i < growth_locked_until and growth_trigger_peak is not None:
-            if g_close.iloc[i] > growth_trigger_peak:
+            # 路径A: 新高解锁（试错机制）
+            if current_price > growth_trigger_peak:
                 growth_locked_until = -1
+                growth_lock_start = -1
                 growth_trigger_peak = None
+                growth_trigger_low = None
+                growth_trigger_peak_rise_pct = None
+                growth_base_lock = 0
+
+            else:
+                # 路径B: 斐波那契阶梯解锁
+                peak = growth_trigger_peak
+                low = growth_trigger_low
+                peak_rise_pct = growth_trigger_peak_rise_pct
+                base_lock = growth_base_lock
+
+                # 回撤深度 = (Peak - Current) / (Peak - Low)
+                drawdown = (peak - current_price) / (peak - low) if peak != low else 0.0
+
+                if peak_rise_pct > big_bull_thresh:
+                    # === 超级大牛市(peak_rise_pct > 50%) ===
+                    if drawdown >= 0.9:
+                        # 回撤>=0.9 → 立即完全解锁
+                        growth_locked_until = -1
+                        growth_lock_start = -1
+                        growth_trigger_peak = None
+                        growth_trigger_low = None
+                        growth_trigger_peak_rise_pct = None
+                        growth_base_lock = 0
+                    elif drawdown >= 0.782:
+                        # 回撤>=0.782 → 锁定时间减半（从触发日算起）
+                        new_lock_end = growth_lock_start + int(base_lock * 0.50)
+                        if new_lock_end < growth_locked_until:
+                            growth_locked_until = new_lock_end
+                else:
+                    # === 普通小牛市(30% < peak_rise_pct ≤ 50%) ===
+                    if drawdown >= 0.618:
+                        # 回撤>0.618 → 完全解锁
+                        growth_locked_until = -1
+                        growth_lock_start = -1
+                        growth_trigger_peak = None
+                        growth_trigger_low = None
+                        growth_trigger_peak_rise_pct = None
+                        growth_base_lock = 0
+                    elif drawdown >= 0.382:
+                        # 回撤>0.382 → 缩短一半（从触发日算起）
+                        new_lock_end = growth_lock_start + int(base_lock * 0.50)
+                        if new_lock_end < growth_locked_until:
+                            growth_locked_until = new_lock_end
+
+        # ===== 锁定中：方向为成长时强制空仓 =====
         if i < growth_locked_until:
             if dir_series.iloc[i] == 'growth':
                 wt.iloc[i] = 0.0
+
+        # ===== 检查是否触发止损（仅当有仓位时才触发）=====
         if growth_high_mom.iloc[i] and wt.iloc[i] > 0.001:
-            growth_trigger_peak = g_high_60d.iloc[i]
-            growth_locked_until = i + params.get('mom_5d_lock', 60)
-            wt.iloc[i] = 0.0
+            growth_trigger_peak = float(g_peak_series.iloc[i])
+            growth_trigger_low = float(g_low_series.iloc[i])
+            growth_trigger_peak_rise_pct = float(g_peak_rise_pct.iloc[i])
+            rise_days = int(g_rise_days.iloc[i])
+            growth_base_lock = min(rise_days, lookback_window)
+            growth_lock_start = i
+            growth_locked_until = i + growth_base_lock
+            wt.iloc[i] = 0.0  # 当天清仓
 
     # ===== L8: 黑天鹅保护 =====
     g_ret_5d = g_close / g_close.shift(params.get('black_swan_lookback', 5)) - 1
@@ -258,7 +389,6 @@ def compute_signals(g_close, v_close, params):
     df['v_dd20'] = v_close.pct_change(20)
     df['is_weak'] = is_weak
     return df
-
 
 
 
@@ -333,7 +463,7 @@ def make_html(signal, df, chart_b64, trades=None, params=None):
     v_days = (recent['dir'] == 'value').sum()
     c_days = n - g_days - v_days
 
-    version_info = f'B4 · DC={p["dc"]} DCD={p["dcd"]} 动量={p["momentum_period"]}日'
+    version_info = f'B4V2 · DC={p["dc"]} DCD={p["dcd"]} 动量={p["momentum_period"]}日 窗口={p.get("l5_lookback_window", 65)}日'
     t60_mean = df['T'].tail(60).abs().mean()
 
     # 最近10天表格
@@ -347,7 +477,7 @@ def make_html(signal, df, chart_b64, trades=None, params=None):
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-<title>B4-动量止损 · 每日信号 — Panda AI</title>
+<title>B4V2-动态牛市止损 · 每日信号 — Panda AI</title>
 <style>
   * {{ margin: 0; padding: 0; box-sizing: border-box; }}
   body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "PingFang SC", "Microsoft YaHei", sans-serif;
@@ -423,7 +553,7 @@ def make_html(signal, df, chart_b64, trades=None, params=None):
 <div class="container">
   <div class="header">
     <div>
-      <h1>⚡ B4-动量止损 · Panda AI</h1>
+      <h1>⚡ B4V2-动态牛市止损 · Panda AI</h1>
       <div class="sub">{version_info}</div>
     </div>
     <div class="date">{beijing_now().strftime('%Y-%m-%d<br>%H:%M')}</div>
@@ -446,13 +576,13 @@ def make_html(signal, df, chart_b64, trades=None, params=None):
         <div class="row"><span class="label">比价偏离MA20</span>
           <span class="value">{latest['dev_pct']:+.2f}%</span></div>
         <div class="row"><span class="label">策略版本</span>
-          <span class="value">B4-动量止损 (6层)</span></div>
+          <span class="value">B4V2-动态牛市止损 (6层)</span></div>
       </div>
     </div>
   </div>
 
   <div class="charts">
-    <img src="data:image/png;base64,{chart_b64}" alt="B4-动量止损信号图表">
+    <img src="data:image/png;base64,{chart_b64}" alt="B4V2-动态牛市止损信号图表">
   </div>
 
   <div class="grid">
@@ -507,9 +637,9 @@ def make_html(signal, df, chart_b64, trades=None, params=None):
   </div>
 
   <div class="footer">
-    B4-动量止损版 · 成长价值ETF轮动策略<br>
-    参数: DC={p["dc"]} DCD={p["dcd"]} rt={p["rt"]} BIAS={p["bias_high"]} 动量={p["momentum_period"]}日<br>
-    第5层: 牛市高点止损(新高可解锁) · 第8层: 黑天鹅保护(固定10日动量解锁)<br>
+    B4V2-动态牛市止损版 · 成长价值ETF轮动策略<br>
+    参数: DC={p["dc"]} DCD={p["dcd"]} rt={p["rt"]} BIAS={p["bias_high"]} 动量={p["momentum_period"]}日 窗口={p.get("l5_lookback_window", 65)}日<br>
+    第5层: 动态牛市止损(斐波那契阶梯解锁·仅超级牛市>50%) · 第8层: 黑天鹅保护(固定10日动量解锁)<br>
     数据来源: baostock · 自动生成于 {beijing_now().strftime('%Y-%m-%d %H:%M')}<br>
     ⚠️ 仅供参考，不构成投资建议
   </div>
@@ -520,17 +650,18 @@ def make_html(signal, df, chart_b64, trades=None, params=None):
 
 # ========== 主流程 ==========
 def main():
-    parser = argparse.ArgumentParser(description='B4-动量止损 每日信号生成器 — Panda AI')
+    parser = argparse.ArgumentParser(description='B4V2-动态牛市止损 每日信号生成器 — Panda AI')
     parser.add_argument('--out-dir', type=str, default=None,
                         help='输出目录，默认 signal_page_b4/docs/')
     args = parser.parse_args()
 
     print('=' * 50)
-    print('  ⚡ B4-动量止损版 (6层) 每日信号生成器')
+    print('  ⚡ B4V2-动态牛市止损版 (6层) 每日信号生成器')
     print(f'  {beijing_now().strftime("%Y-%m-%d %H:%M")}')
-    print(f'  策略版本: B4 (B3 + 第5层 + 第8层·固定10日动量)')
+    print(f'  策略版本: B4V2 (B3 + 第5层·斐波那契阶梯解锁 + 第8层·固定10日动量)')
     print(f'  参数: DC={B4_PARAMS["dc"]} DCD={B4_PARAMS["dcd"]} '
-          f'rt={B4_PARAMS["rt"]} 动量={B4_PARAMS["momentum_period"]}日')
+          f'rt={B4_PARAMS["rt"]} 动量={B4_PARAMS["momentum_period"]}日 '
+          f'窗口={B4_PARAMS.get("l5_lookback_window", 65)}日')
     print('=' * 50)
 
     # 1. 获取数据
@@ -542,8 +673,8 @@ def main():
     g, v = g[common], v[common]
     print(f'  共同交易日: {len(g)}天')
 
-    # 2. 计算信号（B4 6层逻辑）
-    print('\n🧮 计算信号 (B4 6层逻辑)...')
+    # 2. 计算信号（B4V2 6层逻辑）
+    print('\n🧮 计算信号 (B4V2 6层逻辑 - 斐波那契阶梯解锁)...')
     df = compute_signals(g, v, B4_PARAMS)
 
     # 3. 最新信号
@@ -619,7 +750,7 @@ def main():
     # JSON信号输出
     signal_json = {
         'generated_at': beijing_now().strftime('%Y-%m-%d %H:%M:%S'),
-        'strategy': 'B4-动量止损版 (6层)',
+        'strategy': 'B4V2-动态牛市止损版 (6层)',
         'params': B4_PARAMS,
         'latest_signal': {
             'date': df.index[-1].strftime('%Y-%m-%d'),
