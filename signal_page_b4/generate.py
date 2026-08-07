@@ -27,6 +27,12 @@ import pandas as pd
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+import matplotlib.font_manager as fm
+
+# 设置中文字体
+plt.rcParams['font.sans-serif'] = ['SimHei', 'Microsoft YaHei', 'PingFang SC', 'WenQuanYi Micro Hei', 'DejaVu Sans']
+plt.rcParams['axes.unicode_minus'] = False
 
 warnings.filterwarnings('ignore')
 
@@ -57,11 +63,12 @@ B4_PARAMS = dict(
 )
 
 
-# ========== 数据获取 ==========
-def fetch_baostock(code, name, days=500):
-    """从 baostock 获取 ETF 日线数据（带重试机制）"""
-    import baostock as bs
+# ========== 数据获取（本地缓存）==========
+DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data')
 
+def _fetch_baostock_raw(code, name, start_date):
+    """从 baostock 拉取原始数据（带重试），返回 DataFrame[date, open, close] 或 None"""
+    import baostock as bs
     MAX_RETRIES = 5
     BASE_DELAY = 3
 
@@ -69,10 +76,9 @@ def fetch_baostock(code, name, days=500):
         try:
             bs.login()
             end = datetime.now().strftime('%Y-%m-%d')
-            start = (datetime.now() - timedelta(days=days)).strftime('%Y-%m-%d')
             rs = bs.query_history_k_data_plus(
                 f'sz.{code}', 'date,open,close',
-                start_date=start, end_date=end,
+                start_date=start_date, end_date=end,
                 frequency='d', adjustflag='2')
             rows = []
             while rs.next():
@@ -83,11 +89,10 @@ def fetch_baostock(code, name, days=500):
                 df = pd.DataFrame(rows, columns=['date', 'open', 'close'])
                 df = df[df['close'] != '']
                 for c in ['open', 'close']:
-                    df[c] = df[c].astype(float)
+                    df[c] = pd.to_numeric(df[c], errors='coerce')
                 df['date'] = pd.to_datetime(df['date'])
-                df = df.set_index('date').sort_index()
-                print(f'  ✅ {name}({code}): {df.index[0].date()} ~ {df.index[-1].date()} ({len(df)}天)')
-                return df['close']
+                df = df.sort_values('date').reset_index(drop=True)
+                return df
 
             print(f'  ⚠️ {name}({code}): 第{attempt+1}次尝试返回空数据')
 
@@ -103,33 +108,102 @@ def fetch_baostock(code, name, days=500):
             print(f'  🔄 等待 {delay}s 后重试...')
             time.sleep(delay)
 
-    return fetch_akshare(code, name, days)
+    return None
 
 
-def fetch_akshare(code, name, days=500):
-    """备用：从 akshare 获取 ETF 日线数据"""
+def _fetch_akshare_raw(code, name, start_date):
+    """备用：从 akshare 拉取原始数据，返回 DataFrame[date, open, close] 或 None"""
     try:
         import akshare as ak
-
         end = datetime.now().strftime('%Y-%m-%d')
-        start = (datetime.now() - timedelta(days=days)).strftime('%Y-%m-%d')
-
         df = ak.fund_etf_hist_em(symbol=code, period="daily",
-                                 start_date=start, end_date=end, adjust="qfq")
+                                 start_date=start_date, end_date=end, adjust="qfq")
         if df.empty:
-            raise ValueError(f'{name} akshare: 无数据')
-
+            return None
         df = df[['日期', '开盘', '收盘']].rename(columns={
             '日期': 'date', '开盘': 'open', '收盘': 'close'
         })
         df['date'] = pd.to_datetime(df['date'])
-        df = df.set_index('date').sort_index()
-        print(f'  ✅ {name}({code}) [akshare备用]: {df.index[0].date()} ~ {df.index[-1].date()} ({len(df)}天)')
-        return df['close']
-
+        df = df.sort_values('date').reset_index(drop=True)
+        return df
     except Exception as e:
         print(f'  ❌ {name}({code}) akshare备用也失败: {e}')
+        return None
+
+
+def fetch_etf_with_cache(code, name, initial_days=500):
+    """从本地缓存加载ETF数据，仅拉取最新数据
+
+    工作流程：
+      1. 检查本地 data/{code}.csv 是否存在
+      2. 存在 → 加载缓存，获取最后日期，仅拉取该日期之后的数据
+      3. 不存在 → 首次拉取 initial_days 天数据
+      4. 合并后保存回缓存，返回收盘价 Series
+    """
+    os.makedirs(DATA_DIR, exist_ok=True)
+    cache_path = os.path.join(DATA_DIR, f'{code}.csv')
+
+    # 尝试加载缓存
+    last_date = None
+    cached_df = None
+    if os.path.exists(cache_path):
+        try:
+            cached_df = pd.read_csv(cache_path)
+            cached_df['date'] = pd.to_datetime(cached_df['date'])
+            cached_df = cached_df.sort_values('date').reset_index(drop=True)
+            last_date = cached_df['date'].iloc[-1]
+            print(f'  📂 本地缓存 {name}({code}): 已有 {len(cached_df)} 天，截至 {last_date.date()}')
+        except Exception as e:
+            print(f'  ⚠️ 缓存读取失败({e})，重新拉取')
+            cached_df = None
+            last_date = None
+
+    # 决定拉取起始日期
+    if last_date is None:
+        fetch_start = (datetime.now() - timedelta(days=initial_days)).strftime('%Y-%m-%d')
+        print(f'  📡 首次拉取 {name}({code})，从 {fetch_start} 起...')
+    else:
+        # 从缓存最后日期前3天开始拉取，确保重叠覆盖（防止数据修正）
+        fetch_start = (last_date - timedelta(days=3)).strftime('%Y-%m-%d')
+        print(f'  📡 增量拉取 {name}({code})，从 {fetch_start} 起（缓存截至 {last_date.date()}）...')
+
+    # 拉取新数据
+    new_df = _fetch_baostock_raw(code, name, fetch_start)
+    if new_df is None:
+        new_df = _fetch_akshare_raw(code, name, fetch_start)
+    if new_df is None:
+        if cached_df is not None:
+            print(f'  ⚠️ 拉取失败，使用缓存数据')
+            cached_df = cached_df.set_index('date')
+            return cached_df['close']
         raise ValueError(f'{name}: baostock和akshare均无数据')
+
+    # 合并缓存与新数据
+    if cached_df is not None:
+        # 过滤掉缓存中已有的日期（避免重复）
+        existing_dates = set(cached_df['date'])
+        new_df = new_df[~new_df['date'].isin(existing_dates)].copy()
+        if len(new_df) == 0:
+            print(f'  ✅ {name}({code}): 缓存已是最新，无需更新')
+            cached_df = cached_df.set_index('date')
+            return cached_df['close']
+        # 拼接
+        combined = pd.concat([cached_df, new_df], ignore_index=True)
+        combined = combined.sort_values('date').reset_index(drop=True)
+        # 去重（保留最后一条）
+        combined = combined.drop_duplicates(subset='date', keep='last').reset_index(drop=True)
+        added = len(new_df)
+    else:
+        combined = new_df
+        added = len(combined)
+
+    # 保存缓存
+    combined.to_csv(cache_path, index=False, encoding='utf-8')
+    print(f'  💾 缓存已更新: +{added} 天，共 {len(combined)} 天 '
+          f'({combined["date"].iloc[0].date()} ~ {combined["date"].iloc[-1].date()})')
+
+    combined = combined.set_index('date')
+    return combined['close']
 
 
 # ========== B4V2 辅助函数 ==========
@@ -391,16 +465,72 @@ def compute_signals(g_close, v_close, params):
     return df
 
 
+# ========== P&L 净值计算 ==========
+def calc_nav(df, g_close, v_close):
+    """计算策略模拟净值曲线（初始1万元，含交易成本）"""
+    da = g_close.reindex(df.index).ffill()
+    db = v_close.reindex(df.index).ffill()
+    daily_g_ret = da.pct_change()
+    daily_v_ret = db.pct_change()
+    TRADE_COST = 0.0001    # 万1佣金
+    IMPACT_COST = 0.0005   # 5bp冲击成本
+    TOTAL_COST = TRADE_COST + IMPACT_COST  # 单边合计6bp
+    INIT_CAP = 10000
+
+    nav = pd.Series(INIT_CAP, index=df.index)
+    strat_ret = pd.Series(0.0, index=df.index)
+    for i in range(1, len(df)):
+        ps = df.iloc[i - 1]
+        cs = df.iloc[i]
+        cost = 0.0
+        # 调仓判定：方向变化或仓位变化超过1%，扣双边成本
+        if ps['dir'] != cs['dir'] or abs(ps['wt'] - cs['wt']) > 0.01:
+            cost = TOTAL_COST * 2
+        if ps['wt'] > 0 and ps['dir'] == 'growth':
+            strat_ret.iloc[i] = daily_g_ret.iloc[i] * ps['wt'] - cost
+        elif ps['wt'] > 0 and ps['dir'] == 'value':
+            strat_ret.iloc[i] = daily_v_ret.iloc[i] * ps['wt'] - cost
+        else:
+            strat_ret.iloc[i] = -cost
+        nav.iloc[i] = nav.iloc[i - 1] * (1 + strat_ret.iloc[i])
+    return nav, INIT_CAP
 
 
 # ========== 图表生成 ==========
-def make_chart(df):
-    """3子图：比价+MA20 → T值 → 仓位（仅信号，不回测P&L）"""
-    fig, axes = plt.subplots(3, 1, figsize=(12, 8),
-                             gridspec_kw={'height_ratios': [2, 1, 1]})
-    dates = df.index[-120:]
+def make_chart(df, rt=1.3, nav=None, init_cap=10000, full_pnl_pct=0):
+    """4子图：P&L净值 → 比价+MA20 → T值 → 仓位（全周期）"""
+    n_rows = 4 if nav is not None else 3
+    ratios = [1.5, 2, 1, 1] if nav is not None else [2, 1, 1]
+    fig, axes = plt.subplots(n_rows, 1, figsize=(12, 8),
+                             gridspec_kw={'height_ratios': ratios})
 
-    ax = axes[0]
+    if nav is not None:
+        ax = axes[0]
+        base_val = nav.iloc[0]  # 初始净值 10,000
+        ax.plot(nav.index, nav.values, color='#E74C3C', lw=1.5)
+        ax.fill_between(nav.index, base_val, nav.values,
+                        color='#E74C3C', alpha=0.15)
+        ax.axhline(base_val, color='gray', ls=':', lw=0.8)
+        ax.annotate(f'{nav.iloc[-1]:.0f}',
+                    xy=(nav.index[-1], nav.iloc[-1]),
+                    fontsize=11, fontweight='bold', color='#E74C3C',
+                    va='bottom', ha='left')
+        ax.set_title(f'模拟净值 (10,000起)  当前 {nav.iloc[-1]:.0f}  ({full_pnl_pct:+.2f}%)',
+                     fontsize=11, fontweight='bold')
+        ax.set_ylabel('净值 (元)', fontsize=9)
+        # Y轴从初始净值下方开始，确保全周期可见
+        ax.set_ylim(bottom=base_val * 0.97)
+        # X轴日期格式（全周期自动稀疏刻度）
+        locator = mdates.AutoDateLocator(minticks=6, maxticks=12)
+        ax.xaxis.set_major_locator(locator)
+        ax.xaxis.set_major_formatter(mdates.DateFormatter('%m-%d'))
+        plt.setp(ax.xaxis.get_majorticklabels(), rotation=45, ha='right', fontsize=6)
+        ax.grid(alpha=0.2)
+
+    ax_next = 1 if nav is not None else 0
+    dates = df.index  # 全周期
+
+    ax = axes[ax_next]
     ax.plot(dates, df.loc[dates, 'ratio'], color='#333333', lw=1.5, label='GV Ratio')
     ax.plot(dates, df.loc[dates, 'ma20'], color='#E74C3C', ls='--', lw=1, label='MA20')
     ax.axhline(1.0, color='gray', ls=':', alpha=0.4)
@@ -421,17 +551,17 @@ def make_chart(df):
     if last_dir is not None and start_d is not None:
         ax.axvspan(start_d, dates[-1], alpha=0.08, color=dir_colors.get(last_dir, '#CCC'))
 
-    ax = axes[1]
+    ax = axes[ax_next + 1]
     ax.plot(dates, df.loc[dates, 'T'], color='#3498DB', lw=1.5, label='T(z-score)')
     ax.axhline(0, color='gray', ls='-', lw=0.5)
-    ax.axhline(1.3, color='#E74C3C', ls='--', lw=0.8, label='+rt=1.3')
-    ax.axhline(-1.3, color='#2ECC71', ls='--', lw=0.8, label='-rt=1.3')
-    ax.fill_between(dates, 1.3, -1.3, alpha=0.05, color='gray')
+    ax.axhline(rt, color='#E74C3C', ls='--', lw=0.8, label=f'+rt={rt}')
+    ax.axhline(-rt, color='#2ECC71', ls='--', lw=0.8, label=f'-rt={rt}')
+    ax.fill_between(dates, rt, -rt, alpha=0.05, color='gray')
     ax.set_ylabel('T (z-score)', fontsize=9)
     ax.legend(fontsize=8, loc='upper left')
     ax.grid(alpha=0.2)
 
-    ax = axes[2]
+    ax = axes[ax_next + 2]
     ax.fill_between(dates, 0, df.loc[dates, 'wt'], color='#9B59B6', alpha=0.4, step='mid')
     ax.plot(dates, df.loc[dates, 'wt'], color='#9B59B6', lw=1, drawstyle='steps-post')
     ax.set_ylabel('Position', fontsize=9)
@@ -448,8 +578,8 @@ def make_chart(df):
 
 
 # ========== HTML 生成 ==========
-def make_html(signal, df, chart_b64, trades=None, params=None):
-    """生成手机友好的信号页面 HTML"""
+def make_html(signal, df, chart_b64, trades=None, params=None, nav_data=None, init_cap=10000):
+    """生成手机友好的信号页面 HTML（含交互式净值走势图）"""
     p = params or B4_PARAMS
     latest = signal
     pos_cn = {'growth': '📈 成长', 'value': '📉 价值', 'cash': '⏸ 空仓'}
@@ -472,12 +602,17 @@ def make_html(signal, df, chart_b64, trades=None, params=None):
     last10['wt_label'] = last10['wt'].apply(
         lambda w: '空仓' if w == 0 else f'{w * 100:.0f}%')
 
+    # 序列化NAV数据供Chart.js使用
+    nav_json = json.dumps(nav_data) if nav_data else '[]'
+
     return f'''<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
 <title>B4V2-动态牛市止损 · 每日信号 — Panda AI</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-zoom@2.2.0/dist/chartjs-plugin-zoom.min.js"></script>
 <style>
   * {{ margin: 0; padding: 0; box-sizing: border-box; }}
   body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "PingFang SC", "Microsoft YaHei", sans-serif;
@@ -507,7 +642,22 @@ def make_html(signal, df, chart_b64, trades=None, params=None):
   .charts {{ margin-bottom: 12px; }}
   .charts img {{ width: 100%; border-radius: 12px; box-shadow: 0 2px 8px rgba(0,0,0,0.06); }}
 
-  .grid {{ display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 12px; }}
+  .chart-card {{ background: white; border-radius: 16px; padding: 16px;
+    margin-bottom: 12px; box-shadow: 0 2px 12px rgba(0,0,0,0.06); }}
+  .chart-card .title {{ font-size: 13px; font-weight: 600; margin-bottom: 10px;
+    color: #7f8c8d; }}
+  .chart-card .chart-container {{ position: relative; width: 100%; height: 350px; }}
+  .chart-toolbar {{ display: flex; gap: 8px; margin-bottom: 10px; flex-wrap: wrap; align-items: center; }}
+  .chart-toolbar button {{ padding: 6px 14px; border: 1px solid #ddd; border-radius: 8px;
+    background: white; font-size: 12px; cursor: pointer; color: #555;
+    transition: all 0.15s; }}
+  .chart-toolbar button:hover {{ background: #f0f0f0; border-color: #bbb; }}
+  .chart-toolbar button.active {{ background: #e8f0fe; border-color: #1A73E8; color: #1A73E8; }}
+  .chart-toolbar .hint {{ font-size: 11px; color: #999; margin-left: auto; align-self: center; }}
+  .navigator-container {{ position: relative; width: 100%; height: 60px; margin-top: 4px; }}
+  .range-info {{ font-size: 11px; color: #888; text-align: center; margin-top: 4px; }}
+
+  .grid {{ display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 10px; margin-bottom: 12px; }}
   .stat-card {{ background: white; border-radius: 12px; padding: 14px 10px;
     box-shadow: 0 2px 8px rgba(0,0,0,0.06); text-align: center; }}
   .stat-card .num {{ font-size: 26px; font-weight: 700; color: #2c3e50; }}
@@ -542,10 +692,11 @@ def make_html(signal, df, chart_b64, trades=None, params=None):
   @media (max-width: 600px) {{
     .signal-main {{ flex-direction: column; align-items: stretch; }}
     .signal-badge {{ width: 100%; }}
-    .grid {{ grid-template-columns: 1fr 1fr; }}
+    .grid {{ grid-template-columns: 1fr 1fr 1fr; }}
     .header h1 {{ font-size: 15px; }}
     body {{ padding: 8px; }}
     .advice-card .text {{ font-size: 16px; }}
+    .chart-card .chart-container {{ height: 260px; }}
   }}
 </style>
 </head>
@@ -581,6 +732,25 @@ def make_html(signal, df, chart_b64, trades=None, params=None):
     </div>
   </div>
 
+  <!-- 交互式净值走势图 -->
+  <div class="chart-card">
+    <div class="title">📈 策略模拟净值走势</div>
+    <div class="chart-toolbar">
+      <button onclick="setRange('1m')" id="btn-1m">1月</button>
+      <button onclick="setRange('3m')" id="btn-3m">3月</button>
+      <button onclick="setRange('ytd')" id="btn-ytd">年初至今</button>
+      <button onclick="setRange('all')" id="btn-all" class="active">全部</button>
+      <span class="hint">🖱 滚轮放大 · 拖拽平移</span>
+    </div>
+    <div class="chart-container">
+      <canvas id="navChart"></canvas>
+    </div>
+    <div class="navigator-container">
+      <canvas id="navMiniChart"></canvas>
+    </div>
+    <div class="range-info" id="rangeInfo"></div>
+  </div>
+
   <div class="charts">
     <img src="data:image/png;base64,{chart_b64}" alt="B4V2-动态牛市止损信号图表">
   </div>
@@ -601,6 +771,11 @@ def make_html(signal, df, chart_b64, trades=None, params=None):
     <div class="stat-card">
       <div class="num">{t60_mean:.2f}</div>
       <div class="lbl">T均值(60天)</div>
+    </div>
+    <div class="stat-card">
+      <div class="num" style="color:{'#E74C3C' if latest.get('pnl_pct',0) >= 0 else '#2ECC71'}">
+        {latest.get('nav', 0):.0f}</div>
+      <div class="lbl">模拟净值(¥){latest.get('pnl_pct', 0):+.2f}%</div>
     </div>
     <div class="stat-card">
       <div class="num" style="font-size:22px">{latest.get('latest_date','')}</div>
@@ -644,6 +819,316 @@ def make_html(signal, df, chart_b64, trades=None, params=None):
     ⚠️ 仅供参考，不构成投资建议
   </div>
 </div>
+
+<script>
+// 注册缩放插件
+Chart.register(ChartZoom);
+
+const navData = {nav_json};
+const baseVal = {init_cap};
+const totalPoints = navData.length;
+
+// 数据准备：用 x/y 对象格式，适配 linear x轴
+const dataPoints = navData.map((d, i) => ({{ x: i, y: d.value }}));
+const baseLine = navData.map((d, i) => ({{ x: i, y: baseVal }}));
+const labels = navData.map(d => d.date);
+const values = navData.map(d => d.value);
+
+// Y轴自动适配可见数据
+function getYRange(startIdx, endIdx) {{
+  const visible = values.slice(startIdx, endIdx + 1);
+  const min = Math.min(...visible);
+  const max = Math.max(...visible);
+  const pad = (max - min) * 0.08 || 100;
+  return {{ min: Math.floor((min - pad) / 100) * 100, max: Math.ceil((max + pad) / 100) * 100 }};
+}}
+
+// 主图
+const mainCtx = document.getElementById('navChart').getContext('2d');
+
+const mainChart = new Chart(mainCtx, {{
+  type: 'line',
+  data: {{
+    datasets: [{{
+      label: '策略净值',
+      data: dataPoints,
+      borderColor: '#E74C3C',
+      backgroundColor: function(ctx) {{
+        const chart = ctx.chart;
+        const {{ctx: c, chartArea}} = chart;
+        if (!chartArea) return 'rgba(231,76,60,0.15)';
+        const g = c.createLinearGradient(0, chartArea.top, 0, chartArea.bottom);
+        g.addColorStop(0, 'rgba(231,76,60,0.25)');
+        g.addColorStop(1, 'rgba(231,76,60,0.01)');
+        return g;
+      }},
+      fill: true,
+      tension: 0.1,
+      pointRadius: 0,
+      borderWidth: 2,
+      parsing: false,
+    }}, {{
+      label: '初始资金',
+      data: baseLine,
+      borderColor: 'rgba(0,0,0,0.25)',
+      borderDash: [4,4],
+      borderWidth: 1,
+      pointRadius: 0,
+      fill: false,
+      parsing: false,
+    }}]
+  }},
+  options: {{
+    responsive: true,
+    maintainAspectRatio: false,
+    interaction: {{ mode: 'index', intersect: false }},
+    animation: false,
+    plugins: {{
+      legend: {{ display: false }},
+      tooltip: {{
+        backgroundColor: 'rgba(0,0,0,0.8)',
+        titleFont: {{ size: 12 }},
+        bodyFont: {{ size: 13 }},
+        padding: 10,
+        cornerRadius: 8,
+        callbacks: {{
+          title: function(items) {{
+            const idx = Math.round(items[0].parsed.x);
+            return labels[idx] || '';
+          }},
+          label: function(ctx) {{
+            if (ctx.datasetIndex === 0) {{
+              const val = ctx.parsed.y;
+              const pnl = ((val / baseVal) - 1) * 100;
+              return `净值: ¥${{val.toFixed(0)}}  (${{pnl>=0?'+':''}}${{pnl.toFixed(2)}}%)`;
+            }}
+            return `¥${{ctx.parsed.y.toFixed(0)}}`;
+          }}
+        }}
+      }},
+      zoom: {{
+        pan: {{ enabled: true, mode: 'x', threshold: 5 }},
+        zoom: {{
+          wheel: {{ enabled: true }},
+          pinch: {{ enabled: true }},
+          mode: 'x',
+        }},
+        limits: {{
+          x: {{ minRange: 5, min: 0, max: totalPoints - 1 }}
+        }}
+      }}
+    }},
+    scales: {{
+      x: {{
+        type: 'linear',
+        min: 0,
+        max: totalPoints - 1,
+        ticks: {{
+          maxTicksLimit: 10,
+          font: {{ size: 11 }},
+          callback: function(val) {{
+            const i = Math.round(val);
+            if (i >= 0 && i < labels.length) return labels[i].slice(5);
+            return '';
+          }}
+        }},
+        grid: {{ display: false }},
+      }},
+      y: {{
+        ticks: {{ font: {{ size: 11 }}, callback: v => '¥' + v.toFixed(0) }},
+        grid: {{ color: 'rgba(0,0,0,0.06)' }},
+      }}
+    }},
+  }},
+  plugins: [ChartZoom]
+}});
+
+// 迷你导航图
+const miniCtx = document.getElementById('navMiniChart').getContext('2d');
+const miniChart = new Chart(miniCtx, {{
+  type: 'line',
+  data: {{
+    datasets: [{{
+      data: dataPoints,
+      borderColor: '#ccc',
+      backgroundColor: 'rgba(231,76,60,0.1)',
+      fill: true,
+      tension: 0,
+      pointRadius: 0,
+      borderWidth: 1,
+      parsing: false,
+    }}]
+  }},
+  options: {{
+    responsive: true,
+    maintainAspectRatio: false,
+    animation: false,
+    plugins: {{ legend: {{ display: false }}, tooltip: {{ enabled: false }} }},
+    scales: {{
+      x: {{ type: 'linear', display: false, min: 0, max: totalPoints - 1 }},
+      y: {{ display: false }}
+    }},
+    elements: {{ point: {{ radius: 0 }} }}
+  }}
+}});
+
+// 选区状态
+let selStart = 0, selEnd = totalPoints - 1;
+
+// 在迷你图上画选区遮罩和手柄
+const selectionPlugin = {{
+  id: 'selectionOverlay',
+  afterDraw(chart) {{
+    const {{ctx, chartArea, scales}} = chart;
+    if (!chartArea) return;
+    const xScale = scales.x;
+    const left = xScale.getPixelForValue(selStart);
+    const right = xScale.getPixelForValue(selEnd);
+    ctx.save();
+    // 未选中区域遮罩
+    ctx.fillStyle = 'rgba(0,0,0,0.18)';
+    ctx.fillRect(chartArea.left, chartArea.top, left - chartArea.left, chartArea.bottom - chartArea.top);
+    ctx.fillRect(right, chartArea.top, chartArea.right - right, chartArea.bottom - chartArea.top);
+    // 选中边框
+    ctx.strokeStyle = '#E74C3C';
+    ctx.lineWidth = 2;
+    ctx.strokeRect(left, chartArea.top, right - left, chartArea.bottom - chartArea.top);
+    // 手柄
+    ctx.fillStyle = '#E74C3C';
+    const hw = 4;
+    ctx.fillRect(left - hw/2, chartArea.top, hw, chartArea.bottom - chartArea.top);
+    ctx.fillRect(right - hw/2, chartArea.top, hw, chartArea.bottom - chartArea.top);
+    ctx.restore();
+  }}
+}};
+miniChart.config.plugins.push(selectionPlugin);
+
+// 更新主图显示范围
+function applyRange(startIdx, endIdx, clearBtns) {{
+  startIdx = Math.max(0, Math.floor(startIdx));
+  endIdx = Math.min(totalPoints - 1, Math.ceil(endIdx));
+  if (endIdx - startIdx < 5) endIdx = Math.min(totalPoints - 1, startIdx + 5);
+  selStart = startIdx;
+  selEnd = endIdx;
+
+  const yr = getYRange(startIdx, endIdx);
+  mainChart.options.scales.x.min = startIdx;
+  mainChart.options.scales.x.max = endIdx;
+  mainChart.options.scales.y.min = yr.min;
+  mainChart.options.scales.y.max = yr.max;
+  mainChart.update('none');
+  miniChart.update('none');
+
+  const sd = labels[startIdx], ed = labels[endIdx];
+  const sv = values[startIdx], ev = values[endIdx];
+  const pnl = ((ev / sv) - 1) * 100;
+  document.getElementById('rangeInfo').textContent =
+    `${{sd}} → ${{ed}}  |  区间收益: ${{pnl>=0?'+':''}}${{pnl.toFixed(2)}}%  |  ¥${{sv.toFixed(0)}} → ¥${{ev.toFixed(0)}}`;
+
+  if (clearBtns) {{
+    document.querySelectorAll('.chart-toolbar button').forEach(b => b.classList.remove('active'));
+  }}
+}}
+
+// 快捷范围
+function setRange(mode) {{
+  document.querySelectorAll('.chart-toolbar button').forEach(b => b.classList.remove('active'));
+  document.getElementById('btn-' + mode).classList.add('active');
+
+  let start = 0;
+  const end = totalPoints - 1;
+  if (mode === '1m') {{
+    start = Math.max(0, end - 22);
+  }} else if (mode === '3m') {{
+    start = Math.max(0, end - 66);
+  }} else if (mode === 'ytd') {{
+    const ty = labels[end].slice(0, 4);
+    const ys = labels.findIndex(d => d.startsWith(ty + '-01'));
+    start = ys >= 0 ? ys : 0;
+  }}
+  applyRange(start, end, false);
+}}
+
+// 迷你图拖拽
+let isDragging = false, dragMode = null, dragStartIdx = 0, dragSelS = 0, dragSelE = 0;
+const miniCanvas = miniCtx.canvas;
+
+function idxFromEvent(e) {{
+  const rect = miniCanvas.getBoundingClientRect();
+  const x = (e.clientX ?? e.touches[0].clientX) - rect.left;
+  const ca = miniChart.chartArea;
+  if (!ca) return null;
+  const ratio = (x - ca.left) / (ca.right - ca.left);
+  return Math.max(0, Math.min(totalPoints - 1, Math.round(ratio * (totalPoints - 1))));
+}}
+
+miniCanvas.addEventListener('mousedown', function(e) {{
+  const idx = idxFromEvent(e);
+  if (idx === null) return;
+  const hs = Math.max(5, Math.round((selEnd - selStart) * 0.03));
+  if (Math.abs(idx - selStart) <= hs) {{
+    isDragging = true; dragMode = 'left';
+  }} else if (Math.abs(idx - selEnd) <= hs) {{
+    isDragging = true; dragMode = 'right';
+  }} else if (idx > selStart && idx < selEnd) {{
+    isDragging = true; dragMode = 'pan';
+    dragStartIdx = idx; dragSelS = selStart; dragSelE = selEnd;
+  }} else {{
+    const span = selEnd - selStart;
+    let ns = idx - Math.floor(span / 2);
+    applyRange(ns, ns + span, true);
+    isDragging = true; dragMode = 'pan';
+    dragStartIdx = idx; dragSelS = Math.max(0, ns); dragSelE = Math.min(totalPoints-1, ns + span);
+    return;
+  }}
+  miniCanvas.style.cursor = 'grabbing';
+}});
+
+document.addEventListener('mousemove', function(e) {{
+  if (!isDragging) return;
+  const idx = idxFromEvent(e);
+  if (idx === null) return;
+  if (dragMode === 'left') {{
+    applyRange(idx, selEnd, true);
+  }} else if (dragMode === 'right') {{
+    applyRange(selStart, idx, true);
+  }} else if (dragMode === 'pan') {{
+    const dx = idx - dragStartIdx;
+    let ns = dragSelS + dx, ne = dragSelE + dx;
+    if (ns < 0) {{ ns = 0; ne = dragSelE - dragSelS; }}
+    if (ne > totalPoints - 1) {{ ne = totalPoints - 1; ns = ne - (dragSelE - dragSelS); }}
+    applyRange(ns, ne, true);
+  }}
+}});
+
+document.addEventListener('mouseup', function() {{
+  isDragging = false; dragMode = null;
+  miniCanvas.style.cursor = 'crosshair';
+}});
+miniCanvas.style.cursor = 'crosshair';
+
+// 滚轮缩放后同步选区和Y轴
+mainChart.options.plugins.zoom.zoom.onZoomComplete = function({{chart}}) {{
+  const ns = Math.round(chart.scales.x.min);
+  const ne = Math.round(chart.scales.x.max);
+  selStart = ns; selEnd = ne;
+  const yr = getYRange(ns, ne);
+  chart.options.scales.y.min = yr.min;
+  chart.options.scales.y.max = yr.max;
+  chart.update('none');
+  miniChart.update('none');
+  const sd = labels[ns], ed = labels[ne];
+  const sv = values[ns], ev = values[ne];
+  const pnl = ((ev / sv) - 1) * 100;
+  document.getElementById('rangeInfo').textContent =
+    `${{sd}} → ${{ed}}  |  区间收益: ${{pnl>=0?'+':''}}${{pnl.toFixed(2)}}%  |  ¥${{sv.toFixed(0)}} → ¥${{ev.toFixed(0)}}`;
+  document.querySelectorAll('.chart-toolbar button').forEach(b => b.classList.remove('active'));
+}};
+
+// 初始化
+applyRange(0, totalPoints - 1, false);
+document.getElementById('btn-all').classList.add('active');
+</script>
 </body>
 </html>'''
 
@@ -664,11 +1149,11 @@ def main():
           f'窗口={B4_PARAMS.get("l5_lookback_window", 65)}日')
     print('=' * 50)
 
-    # 1. 获取数据
-    print('\n📡 获取行情数据...')
-    g = fetch_baostock(CODE_G, NAME_G, FETCH_DAYS)
-    time.sleep(2)
-    v = fetch_baostock(CODE_V, NAME_V, FETCH_DAYS)
+    # 1. 获取数据（本地缓存，每天仅增量拉取）
+    print('\n📡 获取行情数据（本地缓存）...')
+    g = fetch_etf_with_cache(CODE_G, NAME_G, FETCH_DAYS)
+    time.sleep(1)
+    v = fetch_etf_with_cache(CODE_V, NAME_V, FETCH_DAYS)
     common = g.index.intersection(v.index)
     g, v = g[common], v[common]
     print(f'  共同交易日: {len(g)}天')
@@ -676,6 +1161,13 @@ def main():
     # 2. 计算信号（B4V2 6层逻辑）
     print('\n🧮 计算信号 (B4V2 6层逻辑 - 斐波那契阶梯解锁)...')
     df = compute_signals(g, v, B4_PARAMS)
+
+    # 2.5 计算P&L净值
+    print('\n💰 计算策略模拟净值...')
+    nav, INIT_CAP = calc_nav(df, g, v)
+    current_nav = nav.iloc[-1]
+    pnl_pct = (current_nav / INIT_CAP - 1) * 100
+    print(f'  初始资金: {INIT_CAP}  →  当前: {current_nav:.2f}  ({pnl_pct:+.2f}%)')
 
     # 3. 最新信号
     last = df.iloc[-1]
@@ -723,19 +1215,26 @@ def main():
         'dev_pct': last['dev'] * 100,
         'target': target,
         'advice': advice,
+        'nav': current_nav,
+        'pnl_pct': pnl_pct,
+        'init_cap': INIT_CAP,
         'latest_date': df.index[-1].strftime('%m-%d'),
     }
 
     print(f'\n  📊 最新信号: {latest["dir"]}  仓位: {latest["wt"] * 100:.0f}%  '
-          f'T={last["T"]:+.3f}')
+          f'T={last["T"]:+.3f}  NAV={current_nav:.0f}')
 
-    # 5. 生成图表（仅信号，不回测P&L）
-    print('\n📈 生成信号图表...')
-    chart_b64 = make_chart(df)
+    # 5. 生成图表（含净值曲线）
+    print('\n📈 生成信号图表（含净值曲线）...')
+    chart_b64 = make_chart(df, B4_PARAMS['rt'], nav, init_cap=INIT_CAP, full_pnl_pct=pnl_pct)
+
+    # 序列化NAV数据供交互式图表
+    nav_list = [{'date': d.strftime('%Y-%m-%d'), 'value': float(v)} for d, v in nav.items()]
 
     # 6. 生成HTML
     print('\n📄 生成HTML信号页面...')
-    html = make_html(latest, df, chart_b64, trades, B4_PARAMS)
+    html = make_html(latest, df, chart_b64, trades, B4_PARAMS,
+                     nav_data=nav_list, init_cap=INIT_CAP)
 
     # 7. 输出
     script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -760,6 +1259,8 @@ def main():
             'T_value': float(last['T']),
             'slope': float(last['slope']),
             'deviation_pct': float(last['dev'] * 100),
+            'nav': float(current_nav),
+            'pnl_pct': float(pnl_pct),
             'advice': advice,
         },
         'recent_signals': [
