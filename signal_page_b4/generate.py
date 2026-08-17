@@ -270,16 +270,35 @@ def compute_signals(g_close, v_close, params):
     n = len(t)
     index = t.index
 
-    # ===== L1: 方向确认 (DC) =====
+    # ===== L1: 方向确认 (DC) — 固定周期 + 容差 =====
+    # T>0 → growth, T<0 → value
+    # 需连续 dc 天方向一致才确认
+    # 容差(dc_tolerance): 连续 dc 天中若仅1天反向但 |T| <= dc_tolerance，仍视为一致
     dc = params.get('dc', 5)
+    dc_tolerance = params.get('dc_tolerance', 0.0)
     raw_dir = (t > 0).map({True: 'growth', False: 'value'})
     mask = np.ones(n, dtype=bool)
     for i in range(n):
         if dc > 1:
-            for k in range(1, dc):
-                if i < k or raw_dir.iloc[i] != raw_dir.iloc[i - k]:
+            start = max(0, i - dc + 1)
+            window = raw_dir.iloc[start:i + 1]
+            window_t = t.iloc[start:i + 1]
+            if len(window) < dc:
+                mask[i] = False
+                continue
+            main_dir = window.iloc[-1]  # 以最后一天方向为主方向
+            opp_mask = window != main_dir
+            opp_count = opp_mask.sum()
+            if opp_count == 0:
+                mask[i] = True
+            elif opp_count == 1 and dc_tolerance > 0:
+                opp_idx = window[opp_mask].index[0]
+                if abs(window_t.loc[opp_idx]) <= dc_tolerance:
+                    mask[i] = True
+                else:
                     mask[i] = False
-                    break
+            else:
+                mask[i] = False
     confirmed_dir = raw_dir.where(pd.Series(mask, index=index), np.nan)
 
     # ===== L2: 方向冷却 (DCD) =====
@@ -1194,8 +1213,10 @@ def main():
         cs = df.iloc[i]
         if ps['dir'] != cs['dir'] or abs(ps['wt'] - cs['wt']) > 0.01:
             action = '切换' if ps['dir'] != cs['dir'] else '调仓'
+            # 信号在T日收盘后确认，T+1日执行调仓
+            trade_date = df.index[i + 1] if i + 1 < len(df) else df.index[i]
             trades.append({
-                'date': df.index[i].strftime('%Y-%m-%d'),
+                'date': trade_date.strftime('%Y-%m-%d'),
                 'from': f"{dir_map.get(ps['dir'], ps['dir'])} {ps['wt'] * 100:.0f}%",
                 'to': f"{dir_map.get(cs['dir'], cs['dir'])} {cs['wt'] * 100:.0f}%",
                 'action': action,
