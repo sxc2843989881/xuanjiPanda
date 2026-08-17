@@ -1,4 +1,4 @@
-name: B4V2-动态牛市止损 每日信号更新
+name: B4V3 每日信号更新
 
 on:
   schedule:
@@ -42,7 +42,7 @@ jobs:
           pip install --only-binary=:all: baostock pandas numpy matplotlib
           pip install akshare --no-deps
 
-      - name: 生成B4V2信号页面
+      - name: 生成B4V3信号页面
         run: python signal_page_b4/generate.py
 
       - name: 上传 Pages 制品

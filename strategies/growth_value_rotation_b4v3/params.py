@@ -1,0 +1,66 @@
+"""B4V3 成长价值轮动策略 — 参数配置
+
+B4V3 = B4V2 + 收盘价撮合 + DC容差优化
+
+改进点：
+  - 收盘价撮合（matching_type=0）：读昨日信号，今日收盘价成交
+  - DC容差机制（dc_tolerance=0.09）：连续dc天中允许1天反向但|T|<=0.09
+  - DCD从6天优化至5天
+"""
+
+# ===== 标的配置 =====
+GROWTH_SYMBOL = "480080.SZ"   # 成长100指数（成长方向标的）
+VALUE_SYMBOL = "480081.SZ"    # 价值100指数（价值方向标的）
+
+# ===== 标的ETF（实盘交易用）=====
+GROWTH_ETF = "159259"         # 易方达成长ETF
+VALUE_ETF = "159263"          # 易方达价值ETF
+
+# ===== 核心参数（B4V3 = B4V2 + 收盘价撮合 + DC容差 + DCD优化）=====
+BASELINE_PARAMS = dict(
+    # ---- 第1-4层：B3基础参数 ----
+    dc=5,                # 方向确认天数：T值方向需连续5天一致才确认
+    dc_tolerance=0.09,   # DC容差：连续dc天中允许1天反向但|T|<=该值，仍算一致（0.09=最优）
+    dcd=5,               # 方向冷却天数：换向后需等5天才允许再次换向
+    rt=1.3,              # T弱信号阈值：|T|<1.3 且斜率弱 → 空仓
+    slope_thresh=0.002,  # 弱斜率阈值：比价MA20斜率<0.2%视为无趋势
+    bias_high=0.19,      # BIAS超买阈值：偏离MA20>19%清仓
+    bias_mode='clear',   # BIAS模式：clear=超买时清仓
+
+    # ---- 第5层：牛市止损 — 斐波那契阶梯解锁 ----
+    l5_lookback_window=65,      # 滚动窗口找牛市起点Low，A股超级牛市约3个月
+    l5_min_rise=0.50,           # 最低触发涨幅：仅保留超级牛市，涨幅>50%才触发
+    l5_big_bull_thresh=0.50,    # 超级牛市阈值：涨幅>50%用严格阶梯
+
+    # 斐波那契阶梯解锁（硬编码在逻辑中，非参数化）：
+    #   超级牛市(rise_pct>50%): 0.782→缩短到75%, 1.000→完全解锁
+    #   普通牛市(30%<rise_pct≤50%): 0.382→缩短一半, 0.618→完全解锁
+    #   双路径：突破Peak新高 → 立即解锁（试错机制）
+
+    # ---- 第8层：黑天鹅保护 — 固定10日动量解锁 ----
+    black_swan_g_thresh=0.06,    # 成长5日跌幅阈值：>6%视为黑天鹅
+    black_swan_v_thresh=0.03,    # 价值5日跌幅阈值：>3%视为黑天鹅
+    black_swan_lookback=5,       # 黑天鹅回看窗口：5日
+    momentum_period=10,          # 固定动量解锁周期：10日（最优参数）
+)
+
+# ===== 回测参数 =====
+BACKTEST_CONFIG = dict(
+    start_date="20130101",
+    end_date="20260814",
+    start_capital=1000000,     # 初始资金100万
+    standard_symbol="480080.SZ",  # 基准指数（成长100，数据完整覆盖2012-2026）
+    commission_rate=1,         # 费率档位1（ETF万一免五）
+    account_id="8888",
+    frequency="1d",
+    matching_type=0,           # 1=开盘价撮合, 0=收盘价撮合
+)
+
+# ===== 数据路径 =====
+INDEX_DATA_DIR = r"c:\temp_v72_data"  # 指数日线数据目录
+# 成长100指数文件: index_480080.csv
+# 价值100指数文件: index_480081.csv
+
+# ===== 信号延迟 =====
+# PandaAI引擎要求T+1执行：before_trading(T)读取df_factor[T-1]，handle_data(T)执行
+SIGNAL_DELAY = 1  # 天

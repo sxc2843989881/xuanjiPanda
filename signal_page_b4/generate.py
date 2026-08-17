@@ -1,18 +1,13 @@
-"""B4V2-动态牛市止损版 成长价值轮动策略 — 每日信号生成器
+"""B4V3 成长价值轮动策略 — 每日信号生成器
 本脚本完全自包含，可直接在 GitHub Actions 上运行。
 依赖: pip install baostock pandas numpy matplotlib akshare
 
-B4V2 = B3 + 第5层(动态牛市止损·斐波那契阶梯解锁) + 第8层(黑天鹅保护·固定10日动量解锁)
+B4V3 = B4V2 + 收盘价撮合 + DC容差 + DCD优化
 
-第5层改进（B4V2核心）：
-  仅保留超级牛市（涨幅>50%）触发止损，采用斐波那契阶梯解锁：
-  - 滚动65日窗口找牛市起点Low，从Low到当前价计算涨幅
-  - 触发条件：当前价从Low涨幅>50% + 5日动量转负
-  - 基准锁定天数 = min(rise_days, 65)
-  - 双路径解锁：
-    路径A：突破Peak新高 → 立即解锁（试错机制）
-    路径B：斐波那契阶梯解锁
-      回撤0.782→锁定减半，回撤0.9→立即完全解锁
+改进点：
+  - 收盘价撮合（matching_type=0）：读昨日信号，今日收盘价成交
+  - DC容差机制（dc_tolerance=0.09）：连续dc天中允许1天反向但|T|<=0.09
+  - DCD从6天优化至5天
 """
 import os, base64, io, json, warnings, argparse, time
 from datetime import datetime, timedelta, timezone
@@ -36,22 +31,23 @@ plt.rcParams['axes.unicode_minus'] = False
 
 warnings.filterwarnings('ignore')
 
-# ========== B4V2策略配置 ==========
+# ========== B4V3策略配置 ==========
 CODE_G = '159259'   # 易方达成长ETF
 CODE_V = '159263'   # 易方达价值ETF
 NAME_G = '易方达成长ETF'
 NAME_V = '易方达价值ETF'
 FETCH_DAYS = 500    # 拉取天数
 
-# B4V2策略核心参数（与 strategies/growth_value_rotation_b4v2/params.py BASELINE_PARAMS 一致）
+# B4V3策略核心参数（与 strategies/growth_value_rotation_b4v3/params.py BASELINE_PARAMS 一致）
 B4_PARAMS = dict(
     dc=5,                # 方向确认天数
-    dcd=6,               # 方向冷却天数
+    dc_tolerance=0.09,   # DC容差：连续dc天中允许1天反向但|T|<=0.09，仍算一致
+    dcd=5,               # 方向冷却天数
     rt=1.3,              # T弱信号阈值
     slope_thresh=0.002,  # 弱斜率阈值
     bias_high=0.19,      # BIAS超买阈值
     bias_mode='clear',
-    # 第5层：动态牛市止损 — 斐波那契阶梯解锁（B4V2改进）
+    # 第5层：牛市止损 — 斐波那契阶梯解锁
     l5_lookback_window=65,      # 滚动窗口找牛市起点Low
     l5_min_rise=0.50,           # 最低触发涨幅：仅保留超级牛市，涨幅>50%才触发
     l5_big_bull_thresh=0.50,    # 超级牛市阈值：涨幅>50%用严格阶梯
@@ -206,7 +202,7 @@ def fetch_etf_with_cache(code, name, initial_days=500):
     return combined['close']
 
 
-# ========== B4V2 辅助函数 ==========
+# ========== B4V3 辅助函数 ==========
 def _calc_low_peak_rise(g_close, lookback_window):
     """预计算每个交易日的Low、Peak、peak_rise_pct、current_rise_pct、rise_days
 
@@ -250,19 +246,18 @@ def _calc_low_peak_rise(g_close, lookback_window):
     return low_series, peak_series, peak_rise_pct_series, current_rise_pct_series, rise_days_series
 
 
-# ========== B4V2策略 6层信号计算 ==========
+# ========== B4V3 6层信号计算 ==========
 def compute_signals(g_close, v_close, params):
-    """B4V2-动态牛市止损版 6层信号计算
+    """B4V3 6层信号计算
 
-    B4V2 = B3 + 第5层(动态牛市止损·斐波那契阶梯解锁) + 第8层(黑天鹅保护·固定10日动量解锁)
+    B4V3 = B4V2 + 收盘价撮合 + DC容差 + DCD优化
 
-    第1层 DC   — 方向确认：T值方向需连续 dc 天一致才确认
+    第1层 DC   — 方向确认：T值方向需连续 dc 天一致才确认（容差允许1天反向|T|<=dc_tolerance）
     第2层 DCD  — 方向冷却：换向后需等 dcd 天才允许再次换向
     第3层 弱信号 — T弱+斜率弱 → 空仓
     第4层 BIAS — 超买保护：偏离MA20>bias_high → 清仓
-    第5层 动态牛市止损 — 滚动65日窗口找Low，当前价从Low涨幅>50%+5日动量转负 → 触发止损
-          双路径解锁：新高立即解锁 + 斐波那契阶梯(0.782减半/0.9完全解锁)
-    第8层 黑天鹅保护 — 5日内成长跌>6%且价值跌>3% → 全部空仓，固定10日动量解锁
+    第5层 牛市止损 — 斐波那契阶梯解锁
+    第8层 黑天鹅保护 — 固定10日动量解锁
     """
     # 比价 = 成长/价值
     ratio = g_close / v_close
@@ -322,7 +317,7 @@ def compute_signals(g_close, v_close, params):
     extreme_v = (dir_series == 'value') & (v_bias > params.get('bias_high', 0.19))
     wt[extreme_g | extreme_v] = 0.0
 
-    # ===== L5: 动态牛市止损 — 斐波那契阶梯解锁（B4V2改进）=====
+    # ===== L5: 牛市止损 — 斐波那契阶梯解锁 =====
     lookback_window = params.get('l5_lookback_window', 65)
     min_rise = params.get('l5_min_rise', 0.50)
     big_bull_thresh = params.get('l5_big_bull_thresh', 0.50)
@@ -593,7 +588,7 @@ def make_html(signal, df, chart_b64, trades=None, params=None, nav_data=None, in
     v_days = (recent['dir'] == 'value').sum()
     c_days = n - g_days - v_days
 
-    version_info = f'B4V2 · DC={p["dc"]} DCD={p["dcd"]} 动量={p["momentum_period"]}日 窗口={p.get("l5_lookback_window", 65)}日'
+    version_info = f'B4V3 · DC={p["dc"]} 容差={p.get("dc_tolerance", 0)} DCD={p["dcd"]} 动量={p["momentum_period"]}日 窗口={p.get("l5_lookback_window", 65)}日'
     t60_mean = df['T'].tail(60).abs().mean()
 
     # 最近10天表格
@@ -610,7 +605,7 @@ def make_html(signal, df, chart_b64, trades=None, params=None, nav_data=None, in
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-<title>B4V2-动态牛市止损 · 每日信号 — Panda AI</title>
+<title>B4V3 · 每日信号 — Panda AI</title>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-zoom@2.2.0/dist/chartjs-plugin-zoom.min.js"></script>
 <style>
@@ -704,7 +699,7 @@ def make_html(signal, df, chart_b64, trades=None, params=None, nav_data=None, in
 <div class="container">
   <div class="header">
     <div>
-      <h1>⚡ B4V2-动态牛市止损 · Panda AI</h1>
+      <h1>⚡ B4V3 · Panda AI</h1>
       <div class="sub">{version_info}</div>
     </div>
     <div class="date">{beijing_now().strftime('%Y-%m-%d<br>%H:%M')}</div>
@@ -727,7 +722,7 @@ def make_html(signal, df, chart_b64, trades=None, params=None, nav_data=None, in
         <div class="row"><span class="label">比价偏离MA20</span>
           <span class="value">{latest['dev_pct']:+.2f}%</span></div>
         <div class="row"><span class="label">策略版本</span>
-          <span class="value">B4V2-动态牛市止损 (6层)</span></div>
+          <span class="value">B4V3 (6层 · 收盘价撮合 + DC容差)</span></div>
       </div>
     </div>
   </div>
@@ -752,7 +747,7 @@ def make_html(signal, df, chart_b64, trades=None, params=None, nav_data=None, in
   </div>
 
   <div class="charts">
-    <img src="data:image/png;base64,{chart_b64}" alt="B4V2-动态牛市止损信号图表">
+    <img src="data:image/png;base64,{chart_b64}" alt="B4V3信号图表">
   </div>
 
   <div class="grid">
@@ -812,9 +807,9 @@ def make_html(signal, df, chart_b64, trades=None, params=None, nav_data=None, in
   </div>
 
   <div class="footer">
-    B4V2-动态牛市止损版 · 成长价值ETF轮动策略<br>
-    参数: DC={p["dc"]} DCD={p["dcd"]} rt={p["rt"]} BIAS={p["bias_high"]} 动量={p["momentum_period"]}日 窗口={p.get("l5_lookback_window", 65)}日<br>
-    第5层: 动态牛市止损(斐波那契阶梯解锁·仅超级牛市>50%) · 第8层: 黑天鹅保护(固定10日动量解锁)<br>
+    B4V3 · 成长价值ETF轮动策略<br>
+    参数: DC={p["dc"]} 容差={p.get("dc_tolerance", 0)} DCD={p["dcd"]} rt={p["rt"]} BIAS={p["bias_high"]} 动量={p["momentum_period"]}日<br>
+    第5层: 牛市止损(斐波那契阶梯解锁) · 第8层: 黑天鹅保护(固定10日动量解锁)<br>
     数据来源: baostock · 自动生成于 {beijing_now().strftime('%Y-%m-%d %H:%M')}<br>
     ⚠️ 仅供参考，不构成投资建议
   </div>
@@ -1135,15 +1130,15 @@ document.getElementById('btn-all').classList.add('active');
 
 # ========== 主流程 ==========
 def main():
-    parser = argparse.ArgumentParser(description='B4V2-动态牛市止损 每日信号生成器 — Panda AI')
+    parser = argparse.ArgumentParser(description='B4V3 每日信号生成器 — Panda AI')
     parser.add_argument('--out-dir', type=str, default=None,
                         help='输出目录，默认 signal_page_b4/docs/')
     args = parser.parse_args()
 
     print('=' * 50)
-    print('  ⚡ B4V2-动态牛市止损版 (6层) 每日信号生成器')
+    print('  ⚡ B4V3 (6层) 每日信号生成器')
     print(f'  {beijing_now().strftime("%Y-%m-%d %H:%M")}')
-    print(f'  策略版本: B4V2 (B3 + 第5层·斐波那契阶梯解锁 + 第8层·固定10日动量)')
+    print(f'  策略版本: B4V3 (B4V2 + 收盘价撮合 + DC容差 + DCD优化)')
     print(f'  参数: DC={B4_PARAMS["dc"]} DCD={B4_PARAMS["dcd"]} '
           f'rt={B4_PARAMS["rt"]} 动量={B4_PARAMS["momentum_period"]}日 '
           f'窗口={B4_PARAMS.get("l5_lookback_window", 65)}日')
@@ -1158,8 +1153,8 @@ def main():
     g, v = g[common], v[common]
     print(f'  共同交易日: {len(g)}天')
 
-    # 2. 计算信号（B4V2 6层逻辑）
-    print('\n🧮 计算信号 (B4V2 6层逻辑 - 斐波那契阶梯解锁)...')
+    # 2. 计算信号（B4V3 6层逻辑）
+    print('\n🧮 计算信号 (B4V3 6层逻辑)...')
     df = compute_signals(g, v, B4_PARAMS)
 
     # 2.5 计算P&L净值
@@ -1249,7 +1244,7 @@ def main():
     # JSON信号输出
     signal_json = {
         'generated_at': beijing_now().strftime('%Y-%m-%d %H:%M:%S'),
-        'strategy': 'B4V2-动态牛市止损版 (6层)',
+        'strategy': 'B4V3 (6层)',
         'params': B4_PARAMS,
         'latest_signal': {
             'date': df.index[-1].strftime('%Y-%m-%d'),
