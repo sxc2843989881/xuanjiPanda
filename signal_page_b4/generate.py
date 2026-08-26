@@ -27,8 +27,24 @@ import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 import matplotlib.font_manager as fm
 
-# 设置中文字体
-plt.rcParams['font.sans-serif'] = ['SimHei', 'Microsoft YaHei', 'PingFang SC', 'WenQuanYi Micro Hei', 'DejaVu Sans']
+# 设置中文字体：动态探测可用CJK字体（Windows/Linux CI 通用），找不到则回退 DejaVu Sans
+_CJK_CANDIDATES = [
+    'SimHei', 'Microsoft YaHei', 'PingFang SC', 'Noto Sans CJK SC',
+    'Noto Sans SC', 'Source Han Sans SC', 'WenQuanYi Micro Hei',
+]
+_CJK_FONT = None
+if 'plt' in globals():
+    _available = {f.name for f in fm.fontManager.ttflist}
+    for _name in _CJK_CANDIDATES:
+        if _name in _available:
+            _CJK_FONT = _name
+            break
+if _CJK_FONT:
+    plt.rcParams['font.sans-serif'] = [_CJK_FONT, 'DejaVu Sans']
+    print(f'  🎨 中文字体: {_CJK_FONT}')
+else:
+    plt.rcParams['font.sans-serif'] = ['DejaVu Sans']
+    print('  ⚠️ 未找到中文字体，图表中文可能显示为方块')
 plt.rcParams['axes.unicode_minus'] = False
 
 warnings.filterwarnings('ignore')
@@ -105,7 +121,12 @@ def _fetch_index_raw(code, name, start_date):
             rows = raw.get("data", [])
             if not rows:
                 raise ValueError("数据为空")
-            df = pd.DataFrame(rows, columns=raw["item"])
+            columns = raw.get("item", [])
+            required = {'timestamp', 'close'}
+            missing = required - set(columns)
+            if missing:
+                raise ValueError(f"官方接口字段缺失: {missing}, 实际: {columns}")
+            df = pd.DataFrame(rows, columns=columns)
             df["date"] = pd.to_datetime(df["timestamp"])
             for c in ['open', 'high', 'low', 'close']:
                 if c in df.columns:
@@ -506,40 +527,19 @@ def calc_nav(df, g_close, v_close):
 
 
 # ========== 图表生成 ==========
-def make_chart(df, rt=1.3, nav=None, init_cap=10000, full_pnl_pct=0):
-    """4子图：P&L净值 → 比价+MA20 → T值 → 仓位（全周期）"""
-    n_rows = 4 if nav is not None else 3
-    ratios = [1.5, 2, 1, 1] if nav is not None else [2, 1, 1]
-    fig, axes = plt.subplots(n_rows, 1, figsize=(12, 8),
-                             gridspec_kw={'height_ratios': ratios})
+PLOT_TRADING_DAYS = 126   # 附图展示窗口：约6个月的交易日（数据仍全量计算，仅附图展示近6个月）
 
-    if nav is not None:
-        ax = axes[0]
-        base_val = nav.iloc[0]  # 初始净值 10,000
-        ax.plot(nav.index, nav.values, color='#E74C3C', lw=1.5)
-        ax.fill_between(nav.index, base_val, nav.values,
-                        color='#E74C3C', alpha=0.15)
-        ax.axhline(base_val, color='gray', ls=':', lw=0.8)
-        ax.annotate(f'{nav.iloc[-1]:.0f}',
-                    xy=(nav.index[-1], nav.iloc[-1]),
-                    fontsize=11, fontweight='bold', color='#E74C3C',
-                    va='bottom', ha='left')
-        ax.set_title(f'模拟净值 (10,000起)  当前 {nav.iloc[-1]:.0f}  ({full_pnl_pct:+.2f}%)',
-                     fontsize=11, fontweight='bold')
-        ax.set_ylabel('净值 (元)', fontsize=9)
-        # Y轴从初始净值下方开始，确保全周期可见
-        ax.set_ylim(bottom=base_val * 0.97)
-        # X轴日期格式（全周期自动稀疏刻度）
-        locator = mdates.AutoDateLocator(minticks=6, maxticks=12)
-        ax.xaxis.set_major_locator(locator)
-        ax.xaxis.set_major_formatter(mdates.DateFormatter('%m-%d'))
-        plt.setp(ax.xaxis.get_majorticklabels(), rotation=45, ha='right', fontsize=6)
-        ax.grid(alpha=0.2)
+def make_chart(df, rt=1.3, plot_days=PLOT_TRADING_DAYS):
+    """3子图：GV Ratio+MA20 → T值 → 仓位（仅展示最近 plot_days 个交易日，默认约6个月）"""
+    fig, axes = plt.subplots(3, 1, figsize=(12, 7),
+                             gridspec_kw={'height_ratios': [1.6, 1.15, 1]})
 
-    ax_next = 1 if nav is not None else 0
-    dates = df.index  # 全周期
+    # 只取最近 plot_days 个交易日展示，计算仍基于全量历史
+    plot_df = df.tail(plot_days)
+    plot_dates = plot_df.index
+    dates = plot_dates  # 仅展示最近 plot_days 个交易日
 
-    ax = axes[ax_next]
+    ax = axes[0]
     ax.plot(dates, df.loc[dates, 'ratio'], color='#333333', lw=1.5, label='GV Ratio')
     ax.plot(dates, df.loc[dates, 'ma20'], color='#E74C3C', ls='--', lw=1, label='MA20')
     ax.axhline(1.0, color='gray', ls=':', alpha=0.4)
@@ -560,7 +560,7 @@ def make_chart(df, rt=1.3, nav=None, init_cap=10000, full_pnl_pct=0):
     if last_dir is not None and start_d is not None:
         ax.axvspan(start_d, dates[-1], alpha=0.08, color=dir_colors.get(last_dir, '#CCC'))
 
-    ax = axes[ax_next + 1]
+    ax = axes[1]
     ax.plot(dates, df.loc[dates, 'T'], color='#3498DB', lw=1.5, label='T(z-score)')
     ax.axhline(0, color='gray', ls='-', lw=0.5)
     ax.axhline(rt, color='#E74C3C', ls='--', lw=0.8, label=f'+rt={rt}')
@@ -570,7 +570,7 @@ def make_chart(df, rt=1.3, nav=None, init_cap=10000, full_pnl_pct=0):
     ax.legend(fontsize=8, loc='upper left')
     ax.grid(alpha=0.2)
 
-    ax = axes[ax_next + 2]
+    ax = axes[2]
     ax.fill_between(dates, 0, df.loc[dates, 'wt'], color='#9B59B6', alpha=0.4, step='mid')
     ax.plot(dates, df.loc[dates, 'wt'], color='#9B59B6', lw=1, drawstyle='steps-post')
     ax.set_ylabel('Position', fontsize=9)
@@ -607,8 +607,60 @@ def make_html(signal, df, chart_b64, trades=None, params=None, nav_data=None, in
                     f'动量={p["momentum_period"]}日 窗口={p.get("l5_lookback_window", 65)}日')
     t60_mean = df['T'].tail(60).abs().mean()
 
+    # --- 调仓提示（信号层：对比前一交易日信号，目标是否变化）---
+    sig_prev = df[['dir', 'wt']].shift(1)
+    actions = []
+    for i in range(len(df)):
+        cur = df[['dir', 'wt']].iloc[i]
+        prev = sig_prev.iloc[i]
+        if pd.isna(prev['wt']) or prev['dir'] != cur['dir'] or abs(prev['wt'] - cur['wt']) > 0.01:
+            if cur['wt'] == 0:
+                target = '卖出/空仓'
+            elif cur['dir'] == 'growth':
+                target = f'买入成长 {cur["wt"]*100:.0f}%'
+            else:
+                target = f'买入价值 {cur["wt"]*100:.0f}%'
+            actions.append('⚠ ' + target)
+        else:
+            actions.append('持有')
+    df = df.assign(action=actions)
+
+    # --- 持仓明细（实际持仓线路：信号 T 收盘确认 → T+1 收盘成交 → T+2 起生效）---
+    HOLD_LAG = 2   # 当日实际持仓 = 信号滞后2天
+    eff = df[['dir', 'wt']].shift(HOLD_LAG).copy()
+    eff['dir'] = eff['dir'].fillna('cash')
+    eff['wt'] = eff['wt'].fillna(0.0)
+    _idx = df.index
+    segs = []
+    s_i, s_d, s_w = 0, eff['dir'].iloc[0], eff['wt'].iloc[0]
+    for i in range(1, len(eff)):
+        _d, _w = eff['dir'].iloc[i], eff['wt'].iloc[i]
+        if _d != s_d or abs(_w - s_w) > 0.01:
+            segs.append((s_i, i - 1, s_d, s_w))
+            s_i, s_d, s_w = i, _d, _w
+    segs.append((s_i, len(eff) - 1, s_d, s_w))
+    pos_rows = []
+    for _a, _b, _d, _w in segs:
+        sig_date = f'{_idx[max(0, _a - HOLD_LAG)].strftime("%m-%d")}(信号)' if _a >= HOLD_LAG else '—(起点)'
+        exec_date = f'{_idx[max(0, _a - 1)].strftime("%m-%d")}收盘' if _a >= 1 else '—'
+        start_date = _idx[_a].strftime('%m-%d')
+        end_date = _idx[_b].strftime('%m-%d')
+        if _w == 0:
+            label = '空仓'
+        elif _d == 'growth':
+            label = f'成长 {_w*100:.0f}%'
+        else:
+            label = f'价值 {_w*100:.0f}%'
+        pos_rows.append({
+            'sig': sig_date, 'exec': exec_date,
+            'start': start_date, 'end': end_date,
+            'label': label, 'dir': _d, 'wt': _w,
+            'cur': '当前' if _b == len(eff) - 1 else '',
+        })
+    pos_rows = pos_rows[::-1][:10]
+
     # 最近10天表格
-    last10 = df.tail(10)[['ratio', 'ma20', 'T', 'slope', 'dir', 'wt']].copy()
+    last10 = df.tail(10)[['ratio', 'ma20', 'T', 'slope', 'dir', 'wt', 'action']].copy()
     last10.index = [d.strftime('%m-%d') for d in last10.index]
     last10['wt_label'] = last10['wt'].apply(
         lambda w: '空仓' if w == 0 else f'{w * 100:.0f}%')
@@ -768,6 +820,20 @@ def make_html(signal, df, chart_b64, trades=None, params=None, nav_data=None, in
     <div class="range-info" id="rangeInfo"></div>
   </div>
 
+  <!-- 实盘净值走势（从 2026-08-04 实盘日起，本金10万） -->
+  <div class="chart-card">
+    <div class="title">🔵 实盘净值走势（2026-08-04 起 · 本金¥100,000）</div>
+    <div class="chart-toolbar">
+      <button onclick="liveSetRange('1m')" id="lbtn-1m">1月</button>
+      <button onclick="liveSetRange('3m')" id="lbtn-3m">3月</button>
+      <button onclick="liveSetRange('ytd')" id="lbtn-ytd">年初至今</button>
+      <button onclick="liveSetRange('all')" id="lbtn-all" class="active">全部</button>
+    </div>
+    <div class="chart-container" style="height: 320px;">
+      <canvas id="liveChart"></canvas>
+    </div>
+  </div>
+
   <div class="charts">
     <img src="data:image/png;base64,{chart_b64}" alt="B4V3信号图表">
   </div>
@@ -803,20 +869,33 @@ def make_html(signal, df, chart_b64, trades=None, params=None, nav_data=None, in
   </div>
 
   <div class="advice {'cash' if latest['wt']==0 else latest['dir']}">
-    <div class="adv-title">📢 今日操作</div>
+    <div class="adv-title">📢 今日信号 · 明日待操作</div>
     <div class="adv-text">{'⚠️ 空仓观望' if latest['wt']==0 else ('🚀 做多成长' if latest['dir']=='growth' else '🛡 做多价值')}</div>
-    <div class="adv-sub">{latest['advice']}</div>
+    <div class="adv-sub">{latest['date'].strftime('%m-%d')} 收盘确认 · 明日(下一交易日)收盘调仓：{latest['advice']}</div>
   </div>
 
   <div class="table-card">
-    <div class="title">📋 最近10天信号明细</div>
+    <div class="title">📋 最近10天信号明细<span style="font-size:11px;color:#95a5a6;font-weight:400"> · 信号当日收盘确认，下一交易日收盘调仓</span></div>
     <table>
-      <tr><th>日期</th><th>比价</th><th>MA20</th><th>T值</th><th>斜率</th><th>方向</th><th>仓位</th></tr>
-      {''.join(f'<tr><td>{d}</td><td>{r["ratio"]:.3f}</td><td>{r["ma20"]:.3f}</td>'
-        f'<td>{r["T"]:+.2f}</td><td>{r["slope"]:+.4f}</td>'
+      <tr><th>信号日</th><th>比价</th><th>T值</th><th>方向</th><th>目标仓位</th><th>调仓提示</th></tr>
+      {''.join(f'<tr><td>{d}</td><td>{r["ratio"]:.3f}</td>'
+        f'<td>{r["T"]:+.2f}</td>'
         f'<td><span class="tag tag-{r["dir"]}">{"成长" if r["dir"]=="growth" else "价值" if r["dir"]=="value" else "空仓"}</span></td>'
-        f'<td>{r["wt_label"]}</td></tr>'
+        f'<td>{r["wt_label"]}</td>'
+        f'<td><span style="font-size:11px;color:{"#C0392B" if r["action"].startswith("⚠") else "#7f8c8d"}">{r["action"]}</span></td></tr>'
         for d, r in last10.iterrows())}
+    </table>
+  </div>
+
+  <div class="table-card">
+    <div class="title">📋 持仓明细（最近10段，最新在前）<span style="font-size:11px;color:#95a5a6;font-weight:400"> · 信号产生 → T+1收盘成交 → T+2起生效</span></div>
+    <table>
+      <tr><th>持仓</th><th>信号产生</th><th>收盘调仓</th><th>持仓区间</th><th></th></tr>
+      {''.join(f'<tr><td><span class="tag tag-{p["dir"]}">{p["label"]}</span></td>'
+        f'<td>{p["sig"]}</td><td>{p["exec"]}</td>'
+        f'<td>{p["start"]} → {p["end"]}</td>'
+        f'<td><span style="color:#C0392B;font-size:11px;font-weight:600">{p["cur"]}</span></td></tr>'
+        for p in pos_rows)}
     </table>
   </div>
 
@@ -848,6 +927,7 @@ Chart.register(ChartZoom);
 
 const navData = {nav_json};
 const baseVal = {init_cap};
+const liveDate = '2026-08-04';  // 实盘开始日：此日起线条为实盘(蓝)，此前为模拟盘(红)
 const totalPoints = navData.length;
 
 // 数据准备：用 x/y 对象格式，适配 linear x轴
@@ -965,6 +1045,31 @@ const mainChart = new Chart(mainCtx, {{
   plugins: [ChartZoom]
 }});
 
+// 选区状态（迷你导航图选区遮罩 + 手柄；须在 miniChart 构造前定义，插件经配置传入）
+let selStart = 0, selEnd = totalPoints - 1;
+const selectionPlugin = {{
+  id: 'selectionOverlay',
+  afterDraw(chart) {{
+    const {{ctx, chartArea, scales}} = chart;
+    if (!chartArea) return;
+    const xScale = scales.x;
+    const left = xScale.getPixelForValue(selStart);
+    const right = xScale.getPixelForValue(selEnd);
+    ctx.save();
+    ctx.fillStyle = 'rgba(0,0,0,0.18)';
+    ctx.fillRect(chartArea.left, chartArea.top, left - chartArea.left, chartArea.bottom - chartArea.top);
+    ctx.fillRect(right, chartArea.top, chartArea.right - right, chartArea.bottom - chartArea.top);
+    ctx.strokeStyle = '#E74C3C';
+    ctx.lineWidth = 2;
+    ctx.strokeRect(left, chartArea.top, right - left, chartArea.bottom - chartArea.top);
+    ctx.fillStyle = '#E74C3C';
+    const hw = 4;
+    ctx.fillRect(left - hw/2, chartArea.top, hw, chartArea.bottom - chartArea.top);
+    ctx.fillRect(right - hw/2, chartArea.top, hw, chartArea.bottom - chartArea.top);
+    ctx.restore();
+  }}
+}};
+
 // 迷你导航图
 const miniCtx = document.getElementById('navMiniChart').getContext('2d');
 const miniChart = new Chart(miniCtx, {{
@@ -991,39 +1096,108 @@ const miniChart = new Chart(miniCtx, {{
       y: {{ display: false }}
     }},
     elements: {{ point: {{ radius: 0 }} }}
+  }},
+  plugins: [selectionPlugin]
+}});
+
+// ===== 实盘净值走势图（从 2026-08-04 实盘日起，起始本金10万，蓝线）=====
+const liveIdx0 = navData.findIndex(d => d.date >= liveDate);  // 实盘起始数据索引(8/4)
+const liveBaseNav = navData[liveIdx0].value;  // 8/4 原模拟净值，作为折算比例基准
+const liveBase = 100000;                       // 实盘起始本金 ¥100,000
+const liveData = navData.slice(liveIdx0)
+  .map((d, i) => ({{ x: i, y: d.value / liveBaseNav * liveBase }}));
+const liveRet = liveData.length ? (liveData[liveData.length - 1].y / liveBase - 1) * 100 : 0;
+// 注意：liveData 经 map 后只保留 x/y，丢失 date；日期标签须从原始 navData 取
+const liveLabels = navData.slice(liveIdx0).map(d => d.date);
+const liveLen = liveData.length;
+
+const liveCtx = document.getElementById('liveChart').getContext('2d');
+const liveChart = new Chart(liveCtx, {{
+  type: 'line',
+  data: {{
+    datasets: [{{
+      label: '实盘净值',
+      data: liveData,
+      borderColor: '#3498DB',
+      backgroundColor: function(ctx) {{
+        const chart = ctx.chart;
+        const {{ctx: c, chartArea}} = chart;
+        if (!chartArea) return 'rgba(52,152,219,0.15)';
+        const g = c.createLinearGradient(0, chartArea.top, 0, chartArea.bottom);
+        g.addColorStop(0, 'rgba(52,152,219,0.25)');
+        g.addColorStop(1, 'rgba(52,152,219,0.01)');
+        return g;
+      }},
+      fill: true,
+      tension: 0.1,
+      pointRadius: 0,
+      borderWidth: 2,
+      parsing: false,
+    }}, {{
+      label: '实盘起始',
+      data: liveData.map((p) => ({{ x: p.x, y: liveBase }})),
+      borderColor: 'rgba(0,0,0,0.25)',
+      borderDash: [4, 4],
+      pointRadius: 0,
+      borderWidth: 1,
+      parsing: false,
+    }}],
+  }},
+  options: {{
+    responsive: true,
+    maintainAspectRatio: false,
+    interaction: {{ mode: 'index', intersect: false }},
+    scales: {{
+      x: {{
+        type: 'linear',
+        min: 0,
+        max: liveLen - 1,
+        ticks: {{
+          color: '#888',
+          maxTicksLimit: 8,
+          callback: function(val, i) {{
+            const idx = Math.round(val);
+            const lab = liveLabels[idx];
+            return lab ? lab.slice(5) : '';
+          }},
+        }},
+        grid: {{ display: false }},
+      }},
+      y: {{
+        ticks: {{ color: '#888' }},
+        grid: {{ color: 'rgba(0,0,0,0.05)' }},
+      }},
+    }},
+    plugins: {{
+      legend: {{ display: true, position: 'top', labels: {{ color: '#555' }} }},
+      tooltip: {{
+        callbacks: {{
+          title: function(items) {{
+            const idx = Math.round(items[0].parsed.x);
+            return liveLabels[idx] || '';
+          }},
+          label: function(item) {{
+            return '净值: ¥' + Number(item.parsed.y).toLocaleString();
+          }},
+        }},
+      }},
+    }},
   }}
 }});
 
-// 选区状态
-let selStart = 0, selEnd = totalPoints - 1;
-
-// 在迷你图上画选区遮罩和手柄
-const selectionPlugin = {{
-  id: 'selectionOverlay',
-  afterDraw(chart) {{
-    const {{ctx, chartArea, scales}} = chart;
-    if (!chartArea) return;
-    const xScale = scales.x;
-    const left = xScale.getPixelForValue(selStart);
-    const right = xScale.getPixelForValue(selEnd);
-    ctx.save();
-    // 未选中区域遮罩
-    ctx.fillStyle = 'rgba(0,0,0,0.18)';
-    ctx.fillRect(chartArea.left, chartArea.top, left - chartArea.left, chartArea.bottom - chartArea.top);
-    ctx.fillRect(right, chartArea.top, chartArea.right - right, chartArea.bottom - chartArea.top);
-    // 选中边框
-    ctx.strokeStyle = '#E74C3C';
-    ctx.lineWidth = 2;
-    ctx.strokeRect(left, chartArea.top, right - left, chartArea.bottom - chartArea.top);
-    // 手柄
-    ctx.fillStyle = '#E74C3C';
-    const hw = 4;
-    ctx.fillRect(left - hw/2, chartArea.top, hw, chartArea.bottom - chartArea.top);
-    ctx.fillRect(right - hw/2, chartArea.top, hw, chartArea.bottom - chartArea.top);
-    ctx.restore();
-  }}
-}};
-miniChart.config.plugins.push(selectionPlugin);
+// 实盘图范围切换（1月/3月/年初/全部）
+function liveSetRange(rang) {{
+  document.querySelectorAll('[id^="lbtn-"]').forEach(b => b.classList.remove('active'));
+  const btn = document.getElementById('lbtn-' + rang);
+  if (btn) btn.classList.add('active');
+  let x0 = 0, x1 = liveLen - 1;
+  if (rang === '1m') x0 = Math.max(0, liveLen - 22);
+  else if (rang === '3m') x0 = Math.max(0, liveLen - 66);
+  else if (rang === 'ytd') x0 = 0;  // 实盘始于8/4，年初≈全部
+  liveChart.options.scales.x.min = x0;
+  liveChart.options.scales.x.max = x1;
+  liveChart.update('none');
+}}
 
 // 更新主图显示范围
 function applyRange(startIdx, endIdx, clearBtns) {{
@@ -1266,9 +1440,9 @@ def main():
 
     # 5. 生成图表（含净值曲线）
     print('\n📈 生成信号图表（含净值曲线）...')
-    chart_b64 = make_chart(df, B4_PARAMS['rt'], nav, init_cap=INIT_CAP, full_pnl_pct=pnl_pct)
+    chart_b64 = make_chart(df, B4_PARAMS['rt'])
 
-    # 序列化NAV数据供交互式图表
+    # 序列化NAV数据供交互式净值走势图（展示全量历史）
     nav_list = [{'date': d.strftime('%Y-%m-%d'), 'value': float(v)} for d, v in nav.items()]
 
     # 6. 生成HTML
