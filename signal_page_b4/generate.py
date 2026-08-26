@@ -1,10 +1,12 @@
 """B4V3 成长价值轮动策略 — 每日信号生成器
 本脚本完全自包含，可直接在 GitHub Actions 上运行。
-依赖: pip install baostock pandas numpy matplotlib akshare
+依赖: pip install requests pandas numpy matplotlib
 
 B4V3 = B4V2 + 收盘价撮合 + DC容差 + DCD优化
 
 改进点：
+  - 信号与收益计算与官方引擎同源：使用成长100(480080)/价值100(480081)指数，
+    数据来自 cnindex.com.cn 官网（同 update_data_latest.py 数据源）
   - 收盘价撮合（matching_type=0）：读昨日信号，今日收盘价成交
   - DC容差机制（dc_tolerance=0.09）：连续dc天中允许1天反向但|T|<=0.09
   - DCD从6天优化至5天
@@ -32,11 +34,17 @@ plt.rcParams['axes.unicode_minus'] = False
 warnings.filterwarnings('ignore')
 
 # ========== B4V3策略配置 ==========
-CODE_G = '159259'   # 易方达成长ETF
-CODE_V = '159263'   # 易方达价值ETF
-NAME_G = '易方达成长ETF'
-NAME_V = '易方达价值ETF'
-FETCH_DAYS = 500    # 拉取天数
+# 信号与收益计算统一使用官方引擎同源指数：成长100(480080)/价值100(480081)
+CODE_G = '480080'     # 成长100指数（策略信号基准）
+CODE_V = '480081'     # 价值100指数（策略信号基准）
+NAME_G = '成长100指数'
+NAME_V = '价值100指数'
+# 实盘交易用的ETF（仅用于交易建议展示，收益计算基于指数）
+GROWTH_ETF = '159259'
+VALUE_ETF = '159263'
+GROWTH_ETF_NAME = '易方达成长ETF'
+VALUE_ETF_NAME = '易方达价值ETF'
+FETCH_START = '2012-01-01'   # 拉取起始日期（覆盖官方引擎2013起全量回测）
 
 # B4V3策略核心参数（与 strategies/growth_value_rotation_b4v3/params.py BASELINE_PARAMS 一致）
 B4_PARAMS = dict(
@@ -59,45 +67,55 @@ B4_PARAMS = dict(
 )
 
 
-# ========== 数据获取（本地缓存）==========
+# ========== 数据获取（本地缓存，cnindex官网同源指数）==========
 DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data')
 
-def _fetch_baostock_raw(code, name, start_date):
-    """从 baostock 拉取原始数据（带重试），返回 DataFrame[date, open, close] 或 None"""
-    import baostock as bs
+def _fetch_index_raw(code, name, start_date):
+    """从 cnindex.com.cn 官网拉取指数日线数据（与官方引擎同源）
+
+    API说明: 快速走势 / 日频数据
+      https://hq.cnindex.com.cn/market/market/getIndexDailyDataWithDataFormat
+
+    Returns:
+        DataFrame[date, open, close] 或 None
+    """
+    import requests
     MAX_RETRIES = 5
     BASE_DELAY = 3
+    end = datetime.now().strftime('%Y-%m-%d')
+    url = "https://hq.cnindex.com.cn/market/market/getIndexDailyDataWithDataFormat"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Referer": "http://www.cnindex.com.cn/",
+    }
 
     for attempt in range(MAX_RETRIES):
         try:
-            bs.login()
-            end = datetime.now().strftime('%Y-%m-%d')
-            rs = bs.query_history_k_data_plus(
-                f'sz.{code}', 'date,open,close',
-                start_date=start_date, end_date=end,
-                frequency='d', adjustflag='2')
-            rows = []
-            while rs.next():
-                rows.append(rs.get_row_data())
-            bs.logout()
-
-            if rows:
-                df = pd.DataFrame(rows, columns=['date', 'open', 'close'])
-                df = df[df['close'] != '']
-                for c in ['open', 'close']:
+            params = {
+                "indexCode": code,
+                "startDate": start_date,
+                "endDate": end,
+                "frequency": "day",
+            }
+            r = requests.get(url, params=params, headers=headers, timeout=30)
+            data = r.json()
+            if data.get("code") != 200:
+                raise ValueError(f"API返回code={data.get('code')}")
+            raw = data.get("data", {})
+            rows = raw.get("data", [])
+            if not rows:
+                raise ValueError("数据为空")
+            df = pd.DataFrame(rows, columns=raw["item"])
+            df["date"] = pd.to_datetime(df["timestamp"])
+            for c in ['open', 'high', 'low', 'close']:
+                if c in df.columns:
                     df[c] = pd.to_numeric(df[c], errors='coerce')
-                df['date'] = pd.to_datetime(df['date'])
-                df = df.sort_values('date').reset_index(drop=True)
-                return df
-
-            print(f'  ⚠️ {name}({code}): 第{attempt+1}次尝试返回空数据')
+            df = df.sort_values("date").reset_index(drop=True)
+            df = df.dropna(subset=["close"]).reset_index(drop=True)
+            return df[['date', 'open', 'close']]
 
         except Exception as e:
             print(f'  ⚠️ {name}({code}): 第{attempt+1}次尝试失败 - {e}')
-            try:
-                bs.logout()
-            except:
-                pass
 
         if attempt < MAX_RETRIES - 1:
             delay = BASE_DELAY * (2 ** attempt)
@@ -107,37 +125,17 @@ def _fetch_baostock_raw(code, name, start_date):
     return None
 
 
-def _fetch_akshare_raw(code, name, start_date):
-    """备用：从 akshare 拉取原始数据，返回 DataFrame[date, open, close] 或 None"""
-    try:
-        import akshare as ak
-        end = datetime.now().strftime('%Y-%m-%d')
-        df = ak.fund_etf_hist_em(symbol=code, period="daily",
-                                 start_date=start_date, end_date=end, adjust="qfq")
-        if df.empty:
-            return None
-        df = df[['日期', '开盘', '收盘']].rename(columns={
-            '日期': 'date', '开盘': 'open', '收盘': 'close'
-        })
-        df['date'] = pd.to_datetime(df['date'])
-        df = df.sort_values('date').reset_index(drop=True)
-        return df
-    except Exception as e:
-        print(f'  ❌ {name}({code}) akshare备用也失败: {e}')
-        return None
-
-
-def fetch_etf_with_cache(code, name, initial_days=500):
-    """从本地缓存加载ETF数据，仅拉取最新数据
+def fetch_index_with_cache(code, name, start_date=FETCH_START):
+    """从本地缓存加载指数数据，仅拉取最新数据
 
     工作流程：
-      1. 检查本地 data/{code}.csv 是否存在
+      1. 检查本地 data/index_{code}.csv 是否存在
       2. 存在 → 加载缓存，获取最后日期，仅拉取该日期之后的数据
-      3. 不存在 → 首次拉取 initial_days 天数据
+      3. 不存在 → 首次拉取 start_date 以来全部数据
       4. 合并后保存回缓存，返回收盘价 Series
     """
     os.makedirs(DATA_DIR, exist_ok=True)
-    cache_path = os.path.join(DATA_DIR, f'{code}.csv')
+    cache_path = os.path.join(DATA_DIR, f'index_{code}.csv')
 
     # 尝试加载缓存
     last_date = None
@@ -156,37 +154,30 @@ def fetch_etf_with_cache(code, name, initial_days=500):
 
     # 决定拉取起始日期
     if last_date is None:
-        fetch_start = (datetime.now() - timedelta(days=initial_days)).strftime('%Y-%m-%d')
+        fetch_start = start_date
         print(f'  📡 首次拉取 {name}({code})，从 {fetch_start} 起...')
     else:
-        # 从缓存最后日期前3天开始拉取，确保重叠覆盖（防止数据修正）
-        fetch_start = (last_date - timedelta(days=3)).strftime('%Y-%m-%d')
+        # 从缓存最后日期前5天开始拉取，确保重叠覆盖（防止数据修正）
+        fetch_start = (last_date - timedelta(days=5)).strftime('%Y-%m-%d')
         print(f'  📡 增量拉取 {name}({code})，从 {fetch_start} 起（缓存截至 {last_date.date()}）...')
 
     # 拉取新数据
-    new_df = _fetch_baostock_raw(code, name, fetch_start)
-    if new_df is None:
-        new_df = _fetch_akshare_raw(code, name, fetch_start)
+    new_df = _fetch_index_raw(code, name, fetch_start)
     if new_df is None:
         if cached_df is not None:
             print(f'  ⚠️ 拉取失败，使用缓存数据')
-            cached_df = cached_df.set_index('date')
-            return cached_df['close']
-        raise ValueError(f'{name}: baostock和akshare均无数据')
+            return cached_df.set_index('date')['close']
+        raise ValueError(f'{name}: cnindex官网无数据')
 
     # 合并缓存与新数据
     if cached_df is not None:
-        # 过滤掉缓存中已有的日期（避免重复）
         existing_dates = set(cached_df['date'])
         new_df = new_df[~new_df['date'].isin(existing_dates)].copy()
         if len(new_df) == 0:
             print(f'  ✅ {name}({code}): 缓存已是最新，无需更新')
-            cached_df = cached_df.set_index('date')
-            return cached_df['close']
-        # 拼接
+            return cached_df.set_index('date')['close']
+        # 拼接并去重（保留最后一条）
         combined = pd.concat([cached_df, new_df], ignore_index=True)
-        combined = combined.sort_values('date').reset_index(drop=True)
-        # 去重（保留最后一条）
         combined = combined.drop_duplicates(subset='date', keep='last').reset_index(drop=True)
         added = len(new_df)
     else:
@@ -198,8 +189,7 @@ def fetch_etf_with_cache(code, name, initial_days=500):
     print(f'  💾 缓存已更新: +{added} 天，共 {len(combined)} 天 '
           f'({combined["date"].iloc[0].date()} ~ {combined["date"].iloc[-1].date()})')
 
-    combined = combined.set_index('date')
-    return combined['close']
+    return combined.set_index('date')['close']
 
 
 # ========== B4V3 辅助函数 ==========
@@ -481,7 +471,12 @@ def compute_signals(g_close, v_close, params):
 
 # ========== P&L 净值计算 ==========
 def calc_nav(df, g_close, v_close):
-    """计算策略模拟净值曲线（初始1万元，含交易成本）"""
+    """计算策略模拟净值曲线（初始1万元，含交易成本）— T+1 收盘价成交
+
+    执行口径：信号在 T 日收盘确认 → 于 T+1 日收盘价成交 → 自 T+2 日起按新仓位计收益。
+    因此第 i 个交易日实际持有的仓位 = df.iloc[i-2]（由 T-1 日收盘成交确立），
+    当日收益 = 收盘→收盘涨跌幅 × 该仓位；调仓成本在成交发生的当日计扣。
+    """
     da = g_close.reindex(df.index).ffill()
     db = v_close.reindex(df.index).ffill()
     daily_g_ret = da.pct_change()
@@ -493,12 +488,12 @@ def calc_nav(df, g_close, v_close):
 
     nav = pd.Series(INIT_CAP, index=df.index)
     strat_ret = pd.Series(0.0, index=df.index)
-    for i in range(1, len(df)):
-        ps = df.iloc[i - 1]
-        cs = df.iloc[i]
+    for i in range(2, len(df)):
+        ps = df.iloc[i - 2]                          # 当日实际持有的仓位
+        prev_ps = df.iloc[i - 3] if i - 3 >= 0 else df.iloc[i - 2]  # 成交前原仓位
         cost = 0.0
-        # 调仓判定：方向变化或仓位变化超过1%，扣双边成本
-        if ps['dir'] != cs['dir'] or abs(ps['wt'] - cs['wt']) > 0.01:
+        # 调仓判定：方向变化或仓位变化超过1%，扣双边成本（成交发生于收盘）
+        if prev_ps['dir'] != ps['dir'] or abs(prev_ps['wt'] - ps['wt']) > 0.01:
             cost = TOTAL_COST * 2
         if ps['wt'] > 0 and ps['dir'] == 'growth':
             strat_ret.iloc[i] = daily_g_ret.iloc[i] * ps['wt'] - cost
@@ -607,7 +602,9 @@ def make_html(signal, df, chart_b64, trades=None, params=None, nav_data=None, in
     v_days = (recent['dir'] == 'value').sum()
     c_days = n - g_days - v_days
 
-    version_info = f'B4V3 · DC={p["dc"]} 容差={p.get("dc_tolerance", 0)} DCD={p["dcd"]} 动量={p["momentum_period"]}日 窗口={p.get("l5_lookback_window", 65)}日'
+    version_info = (f'B4V3(指数同源) · 成长100/价值100 · '
+                    f'DC={p["dc"]} 容差={p.get("dc_tolerance", 0)} DCD={p["dcd"]} '
+                    f'动量={p["momentum_period"]}日 窗口={p.get("l5_lookback_window", 65)}日')
     t60_mean = df['T'].tail(60).abs().mean()
 
     # 最近10天表格
@@ -677,12 +674,16 @@ def make_html(signal, df, chart_b64, trades=None, params=None, nav_data=None, in
   .stat-card .num {{ font-size: 26px; font-weight: 700; color: #2c3e50; }}
   .stat-card .lbl {{ font-size: 11px; color: #95a5a6; margin-top: 2px; }}
 
-  .advice-card {{ background: white; border-radius: 16px; padding: 18px 20px;
-    margin-bottom: 12px; box-shadow: 0 2px 12px rgba(0,0,0,0.06); }}
-  .advice-card .title {{ font-size: 13px; font-weight: 600; margin-bottom: 6px;
-    color: #7f8c8d; }}
-  .advice-card .text {{ font-size: 18px; line-height: 1.6; font-weight: 500;
-    color: #2c3e50; }}
+  .advice {{ border-radius: 16px; padding: 14px 18px; margin-bottom: 12px; color: #fff;
+    box-shadow: 0 6px 22px rgba(0,0,0,0.20); position: relative; overflow: hidden; }}
+  .advice::before {{ content: ''; position: absolute; left: 0; top: 0; bottom: 0; width: 6px;
+    background: rgba(255,255,255,0.35); }}
+  .advice .adv-title {{ font-size: 12px; opacity: .9; font-weight: 700; letter-spacing: 2px; }}
+  .advice .adv-text {{ font-size: 24px; font-weight: 800; margin-top: 6px; line-height: 1.35; }}
+  .advice .adv-sub {{ font-size: 12px; opacity: .85; margin-top: 6px; }}
+  .advice.cash {{ background: linear-gradient(135deg, #546E7A, #37474F); }}
+  .advice.growth {{ background: linear-gradient(135deg, #F6A821, #E8890C); }}
+  .advice.value {{ background: linear-gradient(135deg, #43A047, #2E7D32); }}
 
   .table-card {{ background: white; border-radius: 16px; padding: 16px;
     margin-bottom: 12px; box-shadow: 0 2px 12px rgba(0,0,0,0.06);
@@ -709,7 +710,7 @@ def make_html(signal, df, chart_b64, trades=None, params=None, nav_data=None, in
     .grid {{ grid-template-columns: 1fr 1fr 1fr; }}
     .header h1 {{ font-size: 15px; }}
     body {{ padding: 8px; }}
-    .advice-card .text {{ font-size: 16px; }}
+    .advice .adv-text {{ font-size: 19px; }}
     .chart-card .chart-container {{ height: 260px; }}
   }}
 </style>
@@ -730,7 +731,9 @@ def make_html(signal, df, chart_b64, trades=None, params=None, nav_data=None, in
       <div class="signal-meta">
         <div class="row"><span class="label">仓位</span>
           <span class="value">{'空仓' if latest['wt']==0 else f'{latest["wt"]*100:.0f}%'}</span></div>
-        <div class="row"><span class="label">持仓标的</span>
+        <div class="row"><span class="label">信号基准</span>
+          <span class="value">{latest.get('basis', latest['target'])}</span></div>
+        <div class="row"><span class="label">实盘ETF</span>
           <span class="value">{latest['target']}</span></div>
         <div class="row"><span class="label">数据截至</span>
           <span class="value">{latest['date'].strftime('%Y-%m-%d')}</span></div>
@@ -787,9 +790,11 @@ def make_html(signal, df, chart_b64, trades=None, params=None, nav_data=None, in
       <div class="lbl">T均值(60天)</div>
     </div>
     <div class="stat-card">
-      <div class="num" style="color:{'#E74C3C' if latest.get('pnl_pct',0) >= 0 else '#2ECC71'}">
+      <div class="num" style="color:{'#E74C3C' if latest.get('pnl_pct',0) >= 0 else '#2ECC71'};font-size:20px">
         {latest.get('nav', 0):.0f}</div>
-      <div class="lbl">模拟净值(¥){latest.get('pnl_pct', 0):+.2f}%</div>
+      <div class="lbl">模拟净值(¥) 累计{latest.get('pnl_pct', 0):+.2f}%</div>
+      <div class="lbl" style="color:{'#E74C3C' if latest.get('ann_ret',0) >= 0 else '#2ECC71'};font-weight:700">
+        年化{latest.get('ann_ret', 0)*100:+.2f}%</div>
     </div>
     <div class="stat-card">
       <div class="num" style="font-size:22px">{latest.get('latest_date','')}</div>
@@ -797,9 +802,10 @@ def make_html(signal, df, chart_b64, trades=None, params=None, nav_data=None, in
     </div>
   </div>
 
-  <div class="advice-card">
-    <div class="title">💰 交易建议</div>
-    <div class="text">{latest['advice']}</div>
+  <div class="advice {'cash' if latest['wt']==0 else latest['dir']}">
+    <div class="adv-title">📢 今日操作</div>
+    <div class="adv-text">{'⚠️ 空仓观望' if latest['wt']==0 else ('🚀 做多成长' if latest['dir']=='growth' else '🛡 做多价值')}</div>
+    <div class="adv-sub">{latest['advice']}</div>
   </div>
 
   <div class="table-card">
@@ -826,10 +832,12 @@ def make_html(signal, df, chart_b64, trades=None, params=None, nav_data=None, in
   </div>
 
   <div class="footer">
-    B4V3 · 成长价值ETF轮动策略<br>
+    B4V3 · 成长价值轮动策略（指数同源）<br>
+    信号基准: 成长100(480080)/价值100(480081) · 收益按指数收盘价计<br>
+    实盘通道: 易方达成长ETF(159259)/易方达价值ETF(159263)<br>
     参数: DC={p["dc"]} 容差={p.get("dc_tolerance", 0)} DCD={p["dcd"]} rt={p["rt"]} BIAS={p["bias_high"]} 动量={p["momentum_period"]}日<br>
     第5层: 牛市止损(斐波那契阶梯解锁) · 第8层: 黑天鹅保护(固定10日动量解锁)<br>
-    数据来源: baostock · 自动生成于 {beijing_now().strftime('%Y-%m-%d %H:%M')}<br>
+    数据来源: cnindex.com.cn · 自动生成于 {beijing_now().strftime('%Y-%m-%d %H:%M')}<br>
     ⚠️ 仅供参考，不构成投资建议
   </div>
 </div>
@@ -1163,25 +1171,27 @@ def main():
           f'窗口={B4_PARAMS.get("l5_lookback_window", 65)}日')
     print('=' * 50)
 
-    # 1. 获取数据（本地缓存，每天仅增量拉取）
-    print('\n📡 获取行情数据（本地缓存）...')
-    g = fetch_etf_with_cache(CODE_G, NAME_G, FETCH_DAYS)
-    time.sleep(1)
-    v = fetch_etf_with_cache(CODE_V, NAME_V, FETCH_DAYS)
+    # 1. 获取数据（cnindex官网指数，本地缓存，每天仅增量拉取）
+    print('\n📡 获取指数行情（cnindex官网）...')
+    g = fetch_index_with_cache(CODE_G, NAME_G)
+    v = fetch_index_with_cache(CODE_V, NAME_V)
     common = g.index.intersection(v.index)
     g, v = g[common], v[common]
-    print(f'  共同交易日: {len(g)}天')
+    print(f'  共同交易日: {len(g)}天 ({g.index[0].date()} ~ {g.index[-1].date()})')
 
     # 2. 计算信号（B4V3 6层逻辑）
     print('\n🧮 计算信号 (B4V3 6层逻辑)...')
     df = compute_signals(g, v, B4_PARAMS)
 
-    # 2.5 计算P&L净值
+    # 2.5 计算P&L净值（与官方引擎同源：基于指数收盘价）
     print('\n💰 计算策略模拟净值...')
     nav, INIT_CAP = calc_nav(df, g, v)
     current_nav = nav.iloc[-1]
     pnl_pct = (current_nav / INIT_CAP - 1) * 100
-    print(f'  初始资金: {INIT_CAP}  →  当前: {current_nav:.2f}  ({pnl_pct:+.2f}%)')
+    years = max((df.index[-1] - df.index[0]).days / 365.25, 0.1)
+    ann_ret = (current_nav / INIT_CAP) ** (1 / years) - 1 if current_nav > 0 else 0.0
+    print(f'  初始资金: {INIT_CAP}  →  当前: {current_nav:.2f}  ({pnl_pct:+.2f}%)'
+          f'  年化: {ann_ret * 100:.2f}%  ({years:.1f}年)')
 
     # 3. 最新信号
     last = df.iloc[-1]
@@ -1191,19 +1201,31 @@ def main():
     wt_now = last['wt']
     wt_prev = prev['wt']
 
-    target = f'{NAME_G}({CODE_G})' if dir_now == 'growth' else (
-        f'{NAME_V}({CODE_V})' if dir_now == 'value' else '空仓')
+    # 信号基于指数，交易建议给出对应的实盘ETF
+    if dir_now == 'growth':
+        basis_name = f'{NAME_G}({CODE_G})'
+        target = f'{NAME_G}({CODE_G}) · {GROWTH_ETF_NAME}({GROWTH_ETF})'
+        etf_follow = f'{GROWTH_ETF_NAME}({GROWTH_ETF})'
+    elif dir_now == 'value':
+        basis_name = f'{NAME_V}({CODE_V})'
+        target = f'{NAME_V}({CODE_V}) · {VALUE_ETF_NAME}({VALUE_ETF})'
+        etf_follow = f'{VALUE_ETF_NAME}({VALUE_ETF})'
+    else:
+        basis_name = '空仓'
+        target = '空仓'
+        etf_follow = '空仓'
 
     if wt_now == 0:
         advice = '空仓观望 — 多空信号不明确，等待趋势明朗'
     elif dir_now != dir_prev:
-        old_target = f'{NAME_G}({CODE_G})' if dir_prev == 'growth' else f'{NAME_V}({CODE_V})'
-        advice = f'切换：卖出 {old_target}，买入 {target}，仓位 {wt_now * 100:.0f}%'
+        old_etf = f'{GROWTH_ETF_NAME}({GROWTH_ETF})' if dir_prev == 'growth' else (
+            f'{VALUE_ETF_NAME}({VALUE_ETF})' if dir_prev == 'value' else '空仓')
+        advice = f'切换：卖出 {old_etf}，买入 {etf_follow}，仓位 {wt_now * 100:.0f}%'
     elif wt_now < wt_prev:
-        advice = f'降仓：{target} 从 {wt_prev * 100:.0f}% 降低至 {wt_now * 100:.0f}%'
+        advice = f'降仓：{etf_follow} 从 {wt_prev * 100:.0f}% 降低至 {wt_now * 100:.0f}%'
     else:
         hold_text = '买入' if wt_now >= 1.0 else '持有'
-        advice = f'{hold_text} {target}，仓位 {wt_now * 100:.0f}%'
+        advice = f'{hold_text} {etf_follow}，仓位 {wt_now * 100:.0f}%'
 
     # 4. 调仓记录
     trades = []
@@ -1230,9 +1252,11 @@ def main():
         'slope': last['slope'],
         'dev_pct': last['dev'] * 100,
         'target': target,
+        'basis': basis_name,
         'advice': advice,
         'nav': current_nav,
         'pnl_pct': pnl_pct,
+        'ann_ret': ann_ret,
         'init_cap': INIT_CAP,
         'latest_date': df.index[-1].strftime('%m-%d'),
     }
@@ -1265,18 +1289,20 @@ def main():
     # JSON信号输出
     signal_json = {
         'generated_at': beijing_now().strftime('%Y-%m-%d %H:%M:%S'),
-        'strategy': 'B4V3 (6层)',
+        'strategy': 'B4V3 (6层 · 指数同源)',
         'params': B4_PARAMS,
         'latest_signal': {
             'date': df.index[-1].strftime('%Y-%m-%d'),
             'direction': dir_now,
             'position_pct': float(wt_now * 100),
+            'basis_index': basis_name,
             'target_etf': target,
             'T_value': float(last['T']),
             'slope': float(last['slope']),
             'deviation_pct': float(last['dev'] * 100),
             'nav': float(current_nav),
             'pnl_pct': float(pnl_pct),
+            'ann_ret': float(ann_ret),
             'advice': advice,
         },
         'recent_signals': [

@@ -29,18 +29,17 @@ jobs:
         with:
           python-version: '3.10'
 
-      - name: 恢复ETF数据缓存
+      - name: 恢复指数数据缓存
         uses: actions/cache@v4
         with:
           path: signal_page_b4/data
-          key: etf-cache-${{ hashFiles('signal_page_b4/generate.py') }}
+          key: index-cache-${{ hashFiles('signal_page_b4/generate.py') }}
           restore-keys: |
-            etf-cache-
+            index-cache-
 
       - name: 安装依赖
         run: |
-          pip install --only-binary=:all: baostock pandas numpy matplotlib
-          pip install akshare --no-deps
+          pip install requests pandas numpy matplotlib
 
       - name: 生成B4V3信号页面
         run: python signal_page_b4/generate.py
