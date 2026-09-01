@@ -186,7 +186,18 @@ def fetch_index_with_cache(code, name, start_date=FETCH_START):
     new_df = _fetch_index_raw(code, name, fetch_start)
     if new_df is None:
         if cached_df is not None:
-            print(f'  ⚠️ 拉取失败，使用缓存数据')
+            # cnindex失败：尝试 adata ETF 兜底回补缺口
+            print(f'  ⚠️ cnindex官网拉取失败，尝试 adata ETF 兜底...')
+            filled = _etf_fallback_fill(cached_df, code, name)
+            if filled is not None:
+                DATA_SOURCE_LOG.append({
+                    'code': code, 'name': name, 'source': 'adata_etf_fallback',
+                    'last_date': str(filled.index[-1].date()), 'cnindex': 'failed'})
+                return filled
+            DATA_SOURCE_LOG.append({
+                'code': code, 'name': name, 'source': 'stale_cache',
+                'last_date': str(cached_df['date'].iloc[-1].date()), 'cnindex': 'failed'})
+            print(f'  ⚠️ 无ETF兜底可用，使用缓存数据')
             return cached_df.set_index('date')['close']
         raise ValueError(f'{name}: cnindex官网无数据')
 
@@ -196,6 +207,9 @@ def fetch_index_with_cache(code, name, start_date=FETCH_START):
         new_df = new_df[~new_df['date'].isin(existing_dates)].copy()
         if len(new_df) == 0:
             print(f'  ✅ {name}({code}): 缓存已是最新，无需更新')
+            DATA_SOURCE_LOG.append({
+                'code': code, 'name': name, 'source': 'cnindex',
+                'last_date': str(cached_df['date'].iloc[-1].date()), 'cnindex': 'ok'})
             return cached_df.set_index('date')['close']
         # 拼接并去重（保留最后一条）
         combined = pd.concat([cached_df, new_df], ignore_index=True)
@@ -209,7 +223,83 @@ def fetch_index_with_cache(code, name, start_date=FETCH_START):
     combined.to_csv(cache_path, index=False, encoding='utf-8')
     print(f'  💾 缓存已更新: +{added} 天，共 {len(combined)} 天 '
           f'({combined["date"].iloc[0].date()} ~ {combined["date"].iloc[-1].date()})')
+    DATA_SOURCE_LOG.append({
+        'code': code, 'name': name, 'source': 'cnindex',
+        'last_date': str(combined["date"].iloc[-1].date()), 'cnindex': 'ok'})
 
+    return combined.set_index('date')['close']
+
+
+# ========== 数据源兜底：cnindex失败时用 adata ETF 缩放回填补最新缺口 ==========
+# cnindex官网(hq.cnindex.com.cn)可能对境外/GitHub runner 无法访问(拉取失败)，
+# 此时用 adata 拉对应 ETF(159259/159263) 日线(能拿到当天)，按缩放比回补指数最新缺口。
+DATA_SOURCE_LOG = []  # 记录每次运行各指数的数据来源，写入 signal.json 供排查
+
+CODE_ETF_MAP = {CODE_G: GROWTH_ETF, CODE_V: VALUE_ETF}
+
+
+def _fetch_etf_close(etf_code, start_date):
+    """用 adata 拉取 ETF 日线收盘价(能拿到当天)，返回 Series[date]=close 或 None"""
+    try:
+        import adata
+    except ImportError:
+        print('    ⚠️ adata 未安装，无法用ETF兜底')
+        return None
+    try:
+        df = adata.fund.market.get_market_etf(
+            fund_code=etf_code, start_date=start_date, k_type=1)
+        if df is None or len(df) == 0:
+            print(f'    ⚠️ adata ETF {etf_code} 返回空')
+            return None
+        df = df.copy()
+        dc = 'trade_date' if 'trade_date' in df.columns else 'date'
+        df[dc] = pd.to_datetime(df[dc])
+        s = df.set_index(dc)['close'].astype(float).sort_index()
+        s = s[~s.index.duplicated(keep='last')]
+        print(f'    ✅ adata ETF {etf_code}: {s.index[0].date()} ~ {s.index[-1].date()} ({len(s)}天)')
+        return s
+    except Exception as e:
+        print(f'    ⚠️ adata ETF {etf_code} 拉取失败: {e}')
+        return None
+
+
+def _etf_fallback_fill(cached_df, code, name):
+    """cnindex 官网拉取失败时，用 adata 对应ETF按缩放比回补指数缺失的最新交易日。
+    不写回缓存(兜底为近似值)，仅本次运行时融合，等官网恢复后仍以官网真值为准。"""
+    etf_code = CODE_ETF_MAP.get(code)
+    if not etf_code:
+        return None
+    last_idx_date = cached_df['date'].iloc[-1]
+    etf_start = (last_idx_date - timedelta(days=5)).strftime('%Y-%m-%d')
+    print(f'    🔄 cnindex失败，改用 adata ETF {etf_code} 兜底(自{etf_start}起)...')
+    etf_close = _fetch_etf_close(etf_code, etf_start)
+    if etf_close is None:
+        return None
+    ovl = cached_df['date'].isin(etf_close.index)
+    if not ovl.any():
+        print('    ⚠️ 指数缓存与ETF无重叠日，无法计算缩放比')
+        return None
+    last_ovl = cached_df.loc[ovl].iloc[-1]
+    idx_close = float(last_ovl['close'])
+    etf_close_at = float(etf_close.loc[last_ovl['date']])
+    if etf_close_at <= 0:
+        print('    ⚠️ 重叠日ETF收盘<=0，无法缩放')
+        return None
+    scale = idx_close / etf_close_at
+    print(f'    ✅ 缩放比 = 指数{idx_close:.4f} / ETF{etf_close_at:.4f} = {scale:.4f}')
+    new_idx = etf_close[etf_close.index > last_idx_date]
+    if len(new_idx) == 0:
+        print('    ✅ ETF无新增交易日，缓存已是最新')
+        return cached_df.set_index('date')['close']
+    added = pd.DataFrame({
+        'date': new_idx.index,
+        'open': (new_idx * scale).values,
+        'close': (new_idx * scale).values,
+    })
+    combined = pd.concat([cached_df, added], ignore_index=True)
+    combined = (combined.drop_duplicates(subset='date', keep='last')
+                .sort_values('date').reset_index(drop=True))
+    print(f'    💾 ETF兜底回填: +{len(added)}天，更新至 {combined["date"].iloc[-1].date()}')
     return combined.set_index('date')['close']
 
 
@@ -1488,6 +1578,7 @@ def main():
             }
             for d, r in df.tail(10).iterrows()
         ],
+        'data_source': DATA_SOURCE_LOG,
         'trades_count': len(trades),
     }
 
