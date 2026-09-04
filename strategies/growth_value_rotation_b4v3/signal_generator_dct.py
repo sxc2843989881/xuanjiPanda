@@ -147,8 +147,14 @@ def generate_signals(g_close, v_close, params=None):
     esc_day = p.get('esc_day', 0)
     esc_t = p.get('esc_t', 0)
     esc_side = p.get('esc_side', 'both')
+    # 快速反悔阀(esc_revert_window=0 关闭): 提前确认后若T在窗口内翻回原方向,
+    # 立即撤销(不等DC重确认、不扣DCD), 把"切错被困5~28天"压缩到"错1~2天"
+    esc_revert_window = p.get('esc_revert_window', 0)
     raw_dir = (t > 0).map({True: 'BULL', False: 'BEAR'})
     mask = np.ones(n, dtype=bool)
+    esc_last = -1            # 最近一次提前确认的索引
+    esc_last_dir = None      # 该次提前确认的方向
+    revert_ok = set()        # 快速反悔生效的索引(绕过DCD)
     for i in range(n):
         if esc_day and i >= esc_day - 1:
             _wd = raw_dir.iloc[i - esc_day + 1: i + 1]
@@ -159,7 +165,17 @@ def generate_signals(g_close, v_close, params=None):
                 )
                 if _early:
                     mask[i] = True
+                    esc_last = i
+                    esc_last_dir = _wd.iloc[-1]
                     continue
+        # 快速反悔: 提前确认后窗口内T翻向对立方向 → 立即确认反向(撤销提前切换)
+        if (esc_revert_window and esc_last >= 0
+                and esc_last < i <= esc_last + esc_revert_window
+                and raw_dir.iloc[i] != esc_last_dir):
+            mask[i] = True
+            revert_ok.add(i)
+            esc_last = -1  # 反悔后结束本次提前确认的监控
+            continue
         if dc > 1:
             # 往前看 dc 天（含今天），判断是否方向一致（含容差）
             start = max(0, i - dc + 1)
@@ -197,7 +213,8 @@ def generate_signals(g_close, v_close, params=None):
         if pd.isna(curr):
             continue
         if curr != prev:
-            if i - last_switch >= p['dcd']:
+            # 快速反悔的换向绕过DCD冷却(撤销错误比坚持错误便宜)
+            if i - last_switch >= p['dcd'] or i in revert_ok:
                 last_switch = i
                 prev = curr
             new_dir.iloc[i] = prev
