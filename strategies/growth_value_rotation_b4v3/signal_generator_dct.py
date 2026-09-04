@@ -435,15 +435,27 @@ def generate_signals(g_close, v_close, params=None):
         burst_z = p.get('rate_jump_burst_z', None) # 爆发抑制: 若同日1日Δ÷σ>burst_z(极速爆发=风险反转)则抑制方向追随
         jump_lock = p.get('rate_jump_lock', 20)  # 响应窗口天数
         rj_scale = p.get('rate_jump_scale', 0.5) # 降仓缩放系数
+        jump_sides = p.get('rate_jump_sides', 'both')  # both/up/down: 仅响应跳升或仅跳降(方向不对称研究)
+        chg_n = p.get('rate_jump_chg', 5)        # 利率变化窗口天数
+        sig_lb = p.get('rate_jump_sigma_lb', 250) # 常态σ回看期
+        tgate = p.get('rate_jump_tgate', None)   # T门控: 仅|T|<tgate(T不确定区)时允许跳变领先
+        t_agree = p.get('rate_jump_t_agree', False)  # 仅T已与预设同向时才领先(确认模式)
         y10s = y10.reindex(index).ffill()
-        chg5 = y10s.diff(5) * 100
+        chg5 = y10s.diff(chg_n) * 100
         if rel_z is not None:
-            roll = chg5.rolling(250).std()
+            roll = chg5.rolling(sig_lb).std()
             z = chg5 / roll
             preset = pd.Series('none', index=index)
-            preset[z > rel_z] = 'value'     # 相对跳升→价值
-            preset[z < -rel_z] = 'growth'   # 相对跳降→成长
-            evt = (z.abs() > rel_z)
+            if jump_sides in ('both', 'up'):
+                preset[z > rel_z] = 'value'     # 相对跳升→价值
+            if jump_sides in ('both', 'down'):
+                preset[z < -rel_z] = 'growth'   # 相对跳降→成长
+            if jump_sides == 'up':
+                evt = z > rel_z
+            elif jump_sides == 'down':
+                evt = z < -rel_z
+            else:
+                evt = (z.abs() > rel_z)
         else:
             preset = pd.Series('none', index=index)
             preset[chg5 > jump_bp] = 'value'    # 跳升→价值(价值跑赢)
@@ -474,7 +486,15 @@ def generate_signals(g_close, v_close, params=None):
                     if dir_series.iloc[i] != override and wt.iloc[i] > 0.001:
                         dir_series.iloc[i] = override
                 elif rj_mode == 'dir' and override != 'none':
-                    if dir_series.iloc[i] != override and wt.iloc[i] > 0.001:
+                    # T门控: 跳变领先仅在T不确定区(|T|<tgate)生效, 强T区信任主信号
+                    if tgate is not None and abs(t.iloc[i]) >= tgate:
+                        pass
+                    # T同向确认: 仅当T已指向预设方向时才领先(顺水推舟, 不硬顶)
+                    elif t_agree and not (
+                        (override == 'value' and t.iloc[i] < 0) or
+                        (override == 'growth' and t.iloc[i] > 0)):
+                        pass
+                    elif dir_series.iloc[i] != override and wt.iloc[i] > 0.001:
                         dir_series.iloc[i] = override
                 remain -= 1
 
