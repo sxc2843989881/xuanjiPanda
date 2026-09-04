@@ -272,7 +272,7 @@ def generate_signals(g_close, v_close, params=None):
     # 触发条件：持有成长 + rise_pct > min_rise(50%) + 5日动量转负
     # 基准锁定 = min(rise_days, 65)
     #
-    # 超级牛市(rise_pct>50%): 锁满全程; 解锁仅靠新高试错或时间到期
+    # 超级牛市(rise_pct>50%): 0.782→锁定减半(B4V3基线; 锁满全程见B4V4)
     # 普通牛市(30%<rise_pct≤50%): 0.382→缩至一半, 0.618→完全解锁
     # ================================================================
     lookback_window = p.get('l5_lookback_window', 65)
@@ -339,15 +339,10 @@ def generate_signals(g_close, v_close, params=None):
                 drawdown = (peak - current_price) / (peak - low) if peak != low else 0.0
 
                 if peak_rise_pct > big_bull_thresh:
-                    # === 超级大牛市(peak_rise_pct > 50%) ===
-                    # 生产配置: 解锁仅两条路径——新高试错(路径A)或时间到期。
-                    # 原"回撤>=0.782减半"与"回撤>=0.9立即解锁"已从生产移除:
-                    #   深度回撤后的反弹快而不持久, 动量/DC确认时已处高位(用户观点);
-                    #   官方引擎证实: 锁满全程年化+0.78pct/Sharpe+0.038/回撤持平,
-                    #   延长1.5倍则-1.60pct过犹不及。
-                    # l5_halve_mode(消融归档, 默认none): 'none'=锁满全程(生产);
-                    #   'halve'=0.782减半(历史配置); 'extend'=延长1.5倍(已证伪)
-                    halve_mode = p.get('l5_halve_mode', 'none')
+                    # === 超级大牛市(peak_rise_pct > 50%) — B4V3基线: 0.782减半 ===
+                    # 注: "锁满全程"改进已立项为B4V4(官方引擎46.51%/1.844 vs 本版45.73%/1.806)。
+                    # 原"回撤>=0.9立即解锁"已删除: 13年从未触发(死代码)。
+                    halve_mode = p.get('l5_halve_mode', 'halve')
                     if drawdown >= 0.782 and halve_mode == 'extend':
                         _dbg('unlock_extend', i=i, drawdown=round(float(drawdown), 3),
                              rise_pct=round(float(peak_rise_pct), 3))

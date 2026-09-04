@@ -1,4 +1,4 @@
-"""L5超级牛市0.782减半解锁 消融 — PandaAI官方引擎
+﻿"""L5超级牛市0.782减半解锁 消融 — PandaAI官方引擎
 
 背景: 2026-06-26触发L5(涨幅75.4%, 基准锁64天, 原锁至~9/28),
 07-30回撤深度0.872触发减半→8/10提前解锁→8/18买回成长→9月起大跌。
@@ -16,7 +16,7 @@ l5_halve_mode:
 import os, time
 import pandas as pd
 
-os.chdir(r'c:\XuanJLH\pandaai\strategies\growth_value_rotation_b4v3')
+os.chdir(r'c:\XuanJLH\pandaai\strategies\growth_value_rotation_b4v4')
 from signal_generator_dct import load_index_data, generate_signals
 from strategy_shell import run_backtest, read_result
 
@@ -80,6 +80,6 @@ for label, r in results.items():
           f"回撤{r['max_dd']*100:>7.2f}%({ddd:+.2f}pct) Sharpe{r['sharpe']:.3f}({dsh:+.3f})")
     rows.append(dict(case=label, ann=r['annual_ret']*100, dd=r['max_dd']*100,
                      sharpe=r['sharpe'], d_ann=da, d_dd=ddd, d_sharpe=dsh))
-out = r'c:\XuanJLH\pandaai\strategies\growth_value_rotation_b4v3\results\l5_halve_engine.csv'
+out = r'c:\XuanJLH\pandaai\strategies\growth_value_rotation_b4v4\results\l5_halve_engine.csv'
 pd.DataFrame(rows).to_csv(out, index=False, encoding='utf-8-sig')
 print(f'\n已存 {out}')

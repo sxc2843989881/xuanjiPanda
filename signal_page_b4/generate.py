@@ -1,10 +1,13 @@
-"""B4V3 成长价值轮动策略 — 每日信号生成器
+"""B4V4 成长价值轮动策略 — 每日信号生成器（L5锁满全程版）
 本脚本完全自包含，可直接在 GitHub Actions 上运行。
 依赖: pip install requests pandas numpy matplotlib
 
-B4V3 = B4V2 + 收盘价撮合 + DC容差 + DCD优化
+B4V4 = B4V3 + L5超级牛市锁满全程（移除深度回撤提前解锁）
+官方引擎: 年化46.51% / Sharpe1.844 / 回撤-24.24% (vs B4V3 45.73%/1.806)
 
 改进点：
+  - L5超级牛市(涨幅>50%)触发锁定后锁满全程, 移除"回撤>=0.782减半"提前解锁:
+    深度回撤后的反弹快而不持久, 动量/DC确认时已处高位
   - 信号与收益计算与官方引擎同源：使用成长100(480080)/价值100(480081)指数，
     数据来自 cnindex.com.cn 官网（同 update_data_latest.py 数据源）
   - 收盘价撮合（matching_type=0）：读昨日信号，今日收盘价成交
@@ -49,7 +52,7 @@ plt.rcParams['axes.unicode_minus'] = False
 
 warnings.filterwarnings('ignore')
 
-# ========== B4V3策略配置 ==========
+# ========== B4V4策略配置 ==========
 # 信号与收益计算统一使用官方引擎同源指数：成长100(480080)/价值100(480081)
 CODE_G = '480080'     # 成长100指数（策略信号基准）
 CODE_V = '480081'     # 价值100指数（策略信号基准）
@@ -62,7 +65,7 @@ GROWTH_ETF_NAME = '易方达成长ETF'
 VALUE_ETF_NAME = '易方达价值ETF'
 FETCH_START = '2012-01-01'   # 拉取起始日期（覆盖官方引擎2013起全量回测）
 
-# B4V3策略核心参数（与 strategies/growth_value_rotation_b4v3/params.py BASELINE_PARAMS 一致）
+# B4V4策略核心参数（与 strategies/growth_value_rotation_b4v4/params.py BASELINE_PARAMS 一致）
 B4_PARAMS = dict(
     dc=5,                # 方向确认天数
     dc_tolerance=0.09,   # DC容差：连续dc天中允许1天反向但|T|<=0.09，仍算一致
@@ -303,7 +306,7 @@ def _etf_fallback_fill(cached_df, code, name):
     return combined.set_index('date')['close']
 
 
-# ========== B4V3 辅助函数 ==========
+# ========== B4V4 辅助函数 ==========
 def _calc_low_peak_rise(g_close, lookback_window):
     """预计算每个交易日的Low、Peak、peak_rise_pct、current_rise_pct、rise_days
 
@@ -347,17 +350,17 @@ def _calc_low_peak_rise(g_close, lookback_window):
     return low_series, peak_series, peak_rise_pct_series, current_rise_pct_series, rise_days_series
 
 
-# ========== B4V3 6层信号计算 ==========
+# ========== B4V4 6层信号计算 ==========
 def compute_signals(g_close, v_close, params):
-    """B4V3 6层信号计算
+    """B4V4 6层信号计算（L5锁满全程版）
 
-    B4V3 = B4V2 + 收盘价撮合 + DC容差 + DCD优化
+    B4V4 = B4V3 + L5超级牛市锁满全程（移除深度回撤提前解锁）
 
     第1层 DC   — 方向确认：T值方向需连续 dc 天一致才确认（容差允许1天反向|T|<=dc_tolerance）
     第2层 DCD  — 方向冷却：换向后需等 dcd 天才允许再次换向
     第3层 弱信号 — T弱+斜率弱 → 空仓
     第4层 BIAS — 超买保护：偏离MA20>bias_high → 清仓
-    第5层 牛市止损 — 斐波那契阶梯解锁
+    第5层 牛市止损 — 超级牛市锁满全程; 新高试错或时间到期解锁
     第8层 黑天鹅保护 — 固定10日动量解锁
     """
     # 比价 = 成长/价值
@@ -456,6 +459,9 @@ def compute_signals(g_close, v_close, params):
         & (g_mom_5d < 0)
     )
 
+    # L5锁定标记(用于文案区分"L5牛市止损锁定"与"弱信号空仓")
+    l5_lock_flag = np.zeros(n, dtype=bool)
+
     # 顺序追踪成长锁定状态
     growth_locked_until = -1       # 锁定的结束索引（绝对index）
     growth_lock_start = -1         # 触发锁定的起始索引
@@ -515,6 +521,7 @@ def compute_signals(g_close, v_close, params):
         if i < growth_locked_until:
             if dir_series.iloc[i] == 'growth':
                 wt.iloc[i] = 0.0
+                l5_lock_flag[i] = True
 
         # ===== 检查是否触发止损（仅当有仓位时才触发）=====
         if growth_high_mom.iloc[i] and wt.iloc[i] > 0.001:
@@ -569,6 +576,7 @@ def compute_signals(g_close, v_close, params):
     df['g_dd20'] = g_close.pct_change(20)
     df['v_dd20'] = v_close.pct_change(20)
     df['is_weak'] = is_weak
+    df['l5_lock'] = l5_lock_flag
     return df
 
 
@@ -684,7 +692,7 @@ def make_html(signal, df, chart_b64, trades=None, params=None, nav_data=None, in
     v_days = (recent['dir'] == 'value').sum()
     c_days = n - g_days - v_days
 
-    version_info = (f'B4V3(指数同源) · 成长100/价值100 · '
+    version_info = (f'B4V4(指数同源·L5锁满全程) · 成长100/价值100 · '
                     f'DC={p["dc"]} 容差={p.get("dc_tolerance", 0)} DCD={p["dcd"]} '
                     f'动量={p["momentum_period"]}日 窗口={p.get("l5_lookback_window", 65)}日')
     t60_mean = df['T'].tail(60).abs().mean()
@@ -755,7 +763,7 @@ def make_html(signal, df, chart_b64, trades=None, params=None, nav_data=None, in
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-<title>B4V3 · 每日信号 — Panda AI</title>
+<title>B4V4 · 每日信号 — Panda AI</title>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-zoom@2.2.0/dist/chartjs-plugin-zoom.min.js"></script>
 <style>
@@ -853,7 +861,7 @@ def make_html(signal, df, chart_b64, trades=None, params=None, nav_data=None, in
 <div class="container">
   <div class="header">
     <div>
-      <h1>⚡ B4V3 · Panda AI</h1>
+      <h1>⚡ B4V4 · Panda AI</h1>
       <div class="sub">{version_info}</div>
     </div>
     <div class="date">{beijing_now().strftime('%Y-%m-%d<br>%H:%M')}</div>
@@ -878,7 +886,7 @@ def make_html(signal, df, chart_b64, trades=None, params=None, nav_data=None, in
         <div class="row"><span class="label">比价偏离MA20</span>
           <span class="value">{latest['dev_pct']:+.2f}%</span></div>
         <div class="row"><span class="label">策略版本</span>
-          <span class="value">B4V3 (6层 · 收盘价撮合 + DC容差)</span></div>
+          <span class="value">B4V4 (6层 · L5锁满全程 + 收盘价撮合 + DC容差)</span></div>
       </div>
     </div>
   </div>
@@ -917,7 +925,7 @@ def make_html(signal, df, chart_b64, trades=None, params=None, nav_data=None, in
   </div>
 
   <div class="charts">
-    <img src="data:image/png;base64,{chart_b64}" alt="B4V3信号图表">
+    <img src="data:image/png;base64,{chart_b64}" alt="B4V4信号图表">
   </div>
 
   <div class="grid">
@@ -952,7 +960,7 @@ def make_html(signal, df, chart_b64, trades=None, params=None, nav_data=None, in
 
   <div class="advice {'cash' if latest['wt']==0 else latest['dir']}">
     <div class="adv-title">📢 今日信号 · 明日待操作</div>
-    <div class="adv-text">{'⚠️ 空仓观望' if latest['wt']==0 else ('🚀 做多成长' if latest['dir']=='growth' else '🛡 做多价值')}</div>
+    <div class="adv-text">{'🔒 L5牛市止损锁定' if latest['wt']==0 and latest.get('l5_lock') else ('⚠️ 空仓观望' if latest['wt']==0 else ('🚀 做多成长' if latest['dir']=='growth' else '🛡 做多价值'))}</div>
     <div class="adv-sub">{latest['date'].strftime('%m-%d')} 收盘确认 · 明日(下一交易日)收盘调仓：{latest['advice']}</div>
   </div>
 
@@ -993,11 +1001,11 @@ def make_html(signal, df, chart_b64, trades=None, params=None, nav_data=None, in
   </div>
 
   <div class="footer">
-    B4V3 · 成长价值轮动策略（指数同源）<br>
+    B4V4 · 成长价值轮动策略（L5锁满全程 · 指数同源）<br>
     信号基准: 成长100(480080)/价值100(480081) · 收益按指数收盘价计<br>
     实盘通道: 易方达成长ETF(159259)/易方达价值ETF(159263)<br>
     参数: DC={p["dc"]} 容差={p.get("dc_tolerance", 0)} DCD={p["dcd"]} rt={p["rt"]} BIAS={p["bias_high"]} 动量={p["momentum_period"]}日<br>
-    第5层: 牛市止损(斐波那契阶梯解锁) · 第8层: 黑天鹅保护(固定10日动量解锁)<br>
+    第5层: 牛市止损(超级牛市锁满全程; 新高试错或时间到期解锁) · 第8层: 黑天鹅保护(固定10日动量解锁)<br>
     数据来源: cnindex.com.cn · 自动生成于 {beijing_now().strftime('%Y-%m-%d %H:%M')}<br>
     ⚠️ 仅供参考，不构成投资建议
   </div>
@@ -1413,15 +1421,15 @@ document.getElementById('btn-all').classList.add('active');
 
 # ========== 主流程 ==========
 def main():
-    parser = argparse.ArgumentParser(description='B4V3 每日信号生成器 — Panda AI')
+    parser = argparse.ArgumentParser(description='B4V4 每日信号生成器 — Panda AI')
     parser.add_argument('--out-dir', type=str, default=None,
                         help='输出目录，默认 signal_page_b4/docs/')
     args = parser.parse_args()
 
     print('=' * 50)
-    print('  ⚡ B4V3 (6层) 每日信号生成器')
+    print('  ⚡ B4V4 (6层) 每日信号生成器')
     print(f'  {beijing_now().strftime("%Y-%m-%d %H:%M")}')
-    print(f'  策略版本: B4V3 (B4V2 + 收盘价撮合 + DC容差 + DCD优化)')
+    print(f'  策略版本: B4V4 (B4V3 + L5超级牛市锁满全程)')
     print(f'  参数: DC={B4_PARAMS["dc"]} DCD={B4_PARAMS["dcd"]} '
           f'rt={B4_PARAMS["rt"]} 动量={B4_PARAMS["momentum_period"]}日 '
           f'窗口={B4_PARAMS.get("l5_lookback_window", 65)}日')
@@ -1435,8 +1443,8 @@ def main():
     g, v = g[common], v[common]
     print(f'  共同交易日: {len(g)}天 ({g.index[0].date()} ~ {g.index[-1].date()})')
 
-    # 2. 计算信号（B4V3 6层逻辑）
-    print('\n🧮 计算信号 (B4V3 6层逻辑)...')
+    # 2. 计算信号（B4V4 6层逻辑）
+    print('\n🧮 计算信号 (B4V4 6层逻辑)...')
     df = compute_signals(g, v, B4_PARAMS)
 
     # 2.5 计算P&L净值（与官方引擎同源：基于指数收盘价）
@@ -1472,7 +1480,10 @@ def main():
         etf_follow = '空仓'
 
     if wt_now == 0:
-        advice = '空仓观望 — 多空信号不明确，等待趋势明朗'
+        if df['l5_lock'].iloc[-1]:
+            advice = 'L5牛市止损锁定中 — 超级牛市见顶后的锁定期内禁止回买成长，仅允许持有价值或现金，锁定到期或创新高后自动解锁'
+        else:
+            advice = '空仓观望 — 多空信号不明确，等待趋势明朗'
     elif dir_now != dir_prev:
         old_etf = f'{GROWTH_ETF_NAME}({GROWTH_ETF})' if dir_prev == 'growth' else (
             f'{VALUE_ETF_NAME}({VALUE_ETF})' if dir_prev == 'value' else '空仓')
@@ -1507,6 +1518,7 @@ def main():
         'T': last['T'],
         'slope': last['slope'],
         'dev_pct': last['dev'] * 100,
+        'l5_lock': bool(last.get('l5_lock', False)),
         'target': target,
         'basis': basis_name,
         'advice': advice,
@@ -1545,7 +1557,7 @@ def main():
     # JSON信号输出
     signal_json = {
         'generated_at': beijing_now().strftime('%Y-%m-%d %H:%M:%S'),
-        'strategy': 'B4V3 (6层 · 指数同源)',
+        'strategy': 'B4V4 (6层 · L5锁满全程 · 指数同源)',
         'params': B4_PARAMS,
         'latest_signal': {
             'date': df.index[-1].strftime('%Y-%m-%d'),
@@ -1556,6 +1568,7 @@ def main():
             'T_value': float(last['T']),
             'slope': float(last['slope']),
             'deviation_pct': float(last['dev'] * 100),
+            'l5_lock': bool(last.get('l5_lock', False)),
             'nav': float(current_nav),
             'pnl_pct': float(pnl_pct),
             'ann_ret': float(ann_ret),

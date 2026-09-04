@@ -14,6 +14,10 @@
 | `../panda_quantflow/docs/ARCHITECTURE.md` | 引擎架构文档（引擎内置） |
 | `../strategies/` | **策略开发目录** — 所有策略代码存放于此 |
 | `../strategies/growth_value_rotation/` | B1-木星 成长价值轮动策略 |
+| `../strategies/growth_value_rotation_b4v3/` | **B4V3 成长价值轮动**（基线，45.73%/Sharpe1.806） |
+| `../strategies/growth_value_rotation_b4v4/` | **B4V4 成长价值轮动（L5锁满全程版，现行生产）** — 年化46.51%/Sharpe1.844 |
+| `../strategies/growth_value_rotation_b5u_932304/` | **B5U-932304 杠杆策略** — 年化96.77%（2x杠杆） |
+| `../strategies/growth_value_rotation_b5u_932304_mtv/` | **V113 B5U-932304-MTV** — 动量趋势轮动 + L5保护（年化59.44%） |
 | `../research/b1_improvements/` | B1 木星策略改进回测记录 |
 
 ## 策略开发目录
@@ -34,6 +38,23 @@ pandaai/strategies/
 │   ├── run_backtest.py        # ★ 一键回测脚本
 │   ├── df_factors/            # 生成的信号文件
 │   └── results/               # 回测结果
+├── growth_value_rotation_b5u_932304/  # B5U-932304（年化96.77%）
+│   ├── params.py              # 参数配置
+│   ├── signal_generator.py    # B4V2+U层比价动量信号生成
+│   ├── strategy_shell.py      # 策略壳代码（含杠杆支持）
+│   ├── strategy_shell_leveraged.py # 2x杠杆策略壳
+│   ├── run_backtest.py        # 一键回测
+│   ├── run_daily.py           # 每日执行脚本
+│   ├── df_factors/            # 生成的信号文件
+│   └── results/               # 回测结果（含杠杆分析）
+├── growth_value_rotation_b5u_932304_mtv/  # V113 B5U-932304-MTV（年化59.44%）
+│   ├── params.py              # 参数配置（3资产：932304/480080/480081）
+│   ├── signal_generator_v113.py  # V113信号生成器（B5U+L5保护）
+│   ├── strategy_shell.py      # 策略壳代码
+│   ├── run_backtest.py        # 一键回测
+│   ├── run_daily.py           # 每日执行脚本
+│   ├── df_factors/            # 生成的信号文件
+│   └── results/               # 回测结果
 ```
 
 新建策略时，在 `strategies/` 下创建新的子目录，参考 `growth_value_rotation/` 的文件结构，并编写对应的 `PROJECT_GUIDE.md`。
@@ -52,6 +73,16 @@ pandaai/strategies/
 cd c:\XuanJLH\pandaai\strategies\growth_value_rotation
 python run_backtest.py --variant baseline   # 基线B1回测（含数据预检）
 python run_backtest.py --variant dir_lock_20d  # 止损变体回测
+
+# === B5U-932304 杠杆策略（年化96.77%） ===
+cd c:\XuanJLH\pandaai\strategies\growth_value_rotation_b5u_932304
+python run_backtest.py                      # 一键回测（含杠杆分析）
+python run_daily.py                         # 每日信号生成
+
+# === V113 B5U-932304-MTV（年化59.44%+L5保护） ===
+cd c:\XuanJLH\pandaai\strategies\growth_value_rotation_b5u_932304_mtv
+python signal_generator_v113.py             # 生成V113信号
+python run_backtest.py                      # 一键引擎回测
 
 # === 数据更新 ===
 cd c:\XuanJLH\pandaai\strategies\growth_value_rotation
