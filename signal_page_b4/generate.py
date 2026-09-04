@@ -490,14 +490,11 @@ def compute_signals(g_close, v_close, params):
 
                 if peak_rise_pct > big_bull_thresh:
                     # === 超级大牛市(peak_rise_pct > 50%) ===
-                    # 仅0.782减半一档; 完全解锁只靠新高试错(路径A)或时间到期。
-                    # 原"回撤>=0.9立即解锁"已删除: 13年从未触发(锁定期最大回撤0.872),
-                    # 且逻辑与L5使命相悖——崩得越深越该锁, 而非提前缴械。
-                    if drawdown >= 0.782:
-                        # 回撤>=0.782 → 锁定时间减半（从触发日算起）
-                        new_lock_end = growth_lock_start + int(base_lock * 0.50)
-                        if new_lock_end < growth_locked_until:
-                            growth_locked_until = new_lock_end
+                    # 解锁仅两条路径: 新高试错(路径A)或时间到期。
+                    # 原"回撤>=0.782减半"与"回撤>=0.9立即解锁"已删除:
+                    #   深度回撤后的反弹快而不持久, 动量/DC确认时已处高位;
+                    #   官方引擎证实锁满全程年化+0.78pct/Sharpe+0.038/回撤持平。
+                    pass
                 else:
                     # === 普通小牛市(30% < peak_rise_pct ≤ 50%) ===
                     if drawdown >= 0.618:
