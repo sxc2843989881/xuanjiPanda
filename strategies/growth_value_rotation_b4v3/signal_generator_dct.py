@@ -232,6 +232,12 @@ def generate_signals(g_close, v_close, params=None):
     weak_slope = slope.abs() < p['slope_thresh']
     weak_t = t.abs() < p['rt']
     is_weak = weak_t & weak_slope
+    # weak_confirm: 弱信号空仓需连续N天确认(1=原单日触发)。
+    # 依据: 1天/2天弱段空仓期间原方向平均+0.28%/+0.61%(纯噪声踏空),
+    # >5天段-3.92%(真避险) → 空仓作为切换动作应与DC确认哲学对齐
+    wc = p.get('weak_confirm', 1)
+    if wc > 1:
+        is_weak = is_weak & is_weak.astype(int).rolling(wc).sum().ge(wc)
     # L3 弱信号开关（消融实验用；默认开启）
     if p.get('enable_l3', True):
         wt[is_weak] = 0.0
