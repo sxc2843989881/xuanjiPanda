@@ -142,9 +142,24 @@ def generate_signals(g_close, v_close, params=None):
     # ================================================================
     dc = p.get('dc', 5)              # 固定方向确认天数
     dc_tolerance = p.get('dc_tolerance', 0.0)  # 容差阈值
+    # 提前确认层(实验性, esc_day=0 关闭): 连续esc_day天同向且|T|>=esc_t时提前确认方向
+    # 依据: 翻转第3天T<=-0.6时, DC=5窗口剩余2天翻正概率<12%, 深负有惯性
+    esc_day = p.get('esc_day', 0)
+    esc_t = p.get('esc_t', 0)
+    esc_side = p.get('esc_side', 'both')
     raw_dir = (t > 0).map({True: 'BULL', False: 'BEAR'})
     mask = np.ones(n, dtype=bool)
     for i in range(n):
+        if esc_day and i >= esc_day - 1:
+            _wd = raw_dir.iloc[i - esc_day + 1: i + 1]
+            if (_wd == _wd.iloc[-1]).all():
+                _early = (
+                    (_wd.iloc[-1] == 'BEAR' and t.iloc[i] <= -esc_t and esc_side in ('both', 'value')) or
+                    (_wd.iloc[-1] == 'BULL' and t.iloc[i] >= esc_t and esc_side in ('both', 'growth'))
+                )
+                if _early:
+                    mask[i] = True
+                    continue
         if dc > 1:
             # 往前看 dc 天（含今天），判断是否方向一致（含容差）
             start = max(0, i - dc + 1)
@@ -200,7 +215,9 @@ def generate_signals(g_close, v_close, params=None):
     weak_slope = slope.abs() < p['slope_thresh']
     weak_t = t.abs() < p['rt']
     is_weak = weak_t & weak_slope
-    wt[is_weak] = 0.0
+    # L3 弱信号开关（消融实验用；默认开启）
+    if p.get('enable_l3', True):
+        wt[is_weak] = 0.0
 
     # ================================================================
     # 第4层: 方向映射 + BIAS 超买保护
@@ -379,6 +396,70 @@ def generate_signals(g_close, v_close, params=None):
             growth_locked = True
             value_locked = True
             wt.iloc[i] = 0.0  # 当天清仓
+
+    # ================================================================
+    # 第9层: 利率跳变响应层 (用户观点: 只关注利率跳变日期)
+    #
+    # 10Y水平/连续斜率是滞后信号(反映已发生的市场); 只有"利率跳变事件"
+    # 携带新的风险/风格信息。实证(2013-2026): Δ>20bp事件后20日, 预设方向
+    #   (升→价值/降→成长)均收益+5.39% vs 反向+1.39% = +4.00pct领先奖励。
+    #
+    # rate_jump_mode 三种响应方式：
+    #   none       — 不启用
+    #   dir        — 方向领先: 跳变预设方向≠当前方向则切到预设方向(已测, 官方引擎无改善)
+    #   scale      — 降仓避险: 跳变窗口内当前持仓权重×rate_jump_scale(风险来临降暴露)
+    #   scale_dir  — 降仓+换向: 窗口内权重×scale, 且方向不一致时切到跳变方向
+    # ================================================================
+    y10 = p.get('y10', None)
+    rj_mode = p.get('rate_jump_mode', 'none')
+    if y10 is not None and rj_mode != 'none':
+        jump_bp = p.get('rate_jump_bp', 20)      # 5日利率变化阈值(bp), 双向
+        rel_z = p.get('rate_jump_rel_z', None)   # 相对跳变: 5日Δ÷250日常态σ>rel_z (贴合环境)
+        burst_z = p.get('rate_jump_burst_z', None) # 爆发抑制: 若同日1日Δ÷σ>burst_z(极速爆发=风险反转)则抑制方向追随
+        jump_lock = p.get('rate_jump_lock', 20)  # 响应窗口天数
+        rj_scale = p.get('rate_jump_scale', 0.5) # 降仓缩放系数
+        y10s = y10.reindex(index).ffill()
+        chg5 = y10s.diff(5) * 100
+        if rel_z is not None:
+            roll = chg5.rolling(250).std()
+            z = chg5 / roll
+            preset = pd.Series('none', index=index)
+            preset[z > rel_z] = 'value'     # 相对跳升→价值
+            preset[z < -rel_z] = 'growth'   # 相对跳降→成长
+            evt = (z.abs() > rel_z)
+        else:
+            preset = pd.Series('none', index=index)
+            preset[chg5 > jump_bp] = 'value'    # 跳升→价值(价值跑赢)
+            preset[chg5 < -jump_bp] = 'growth'  # 跳降→成长(成长跑赢)
+            evt = (chg5.abs() > jump_bp)
+        # 爆发掩码: 单日极速突变(1日Δ÷σ>burst_z)视为风险/反转, 抑制当次日方向追随
+        burst = None
+        if burst_z is not None:
+            chg1 = y10s.diff(1) * 100
+            roll1 = chg1.rolling(250).std()
+            burst = (chg1 / roll1).abs() > burst_z
+        remain = 0
+        override = 'none'
+        for i in range(n):
+            if evt.iloc[i]:
+                remain = jump_lock + 1
+                # 爆发抑制: 触发当日为单日极速爆发则本次不切方向(避免追反转)
+                if burst is not None and burst.iloc[i]:
+                    override = 'none'
+                else:
+                    override = preset.iloc[i] if dir_series.iloc[i] != preset.iloc[i] else 'none'
+            if remain > 0:
+                # 降仓: 窗口内当前有持仓则缩权重
+                if rj_mode in ('scale', 'scale_dir') and wt.iloc[i] > 0.001:
+                    wt.iloc[i] = wt.iloc[i] * rj_scale
+                # 换向: 窗口内若方向不一致且选择了换向模式
+                if rj_mode == 'scale_dir' and override != 'none':
+                    if dir_series.iloc[i] != override and wt.iloc[i] > 0.001:
+                        dir_series.iloc[i] = override
+                elif rj_mode == 'dir' and override != 'none':
+                    if dir_series.iloc[i] != override and wt.iloc[i] > 0.001:
+                        dir_series.iloc[i] = override
+                remain -= 1
 
     return _signals_to_df_factor(dir_series, wt)
 
