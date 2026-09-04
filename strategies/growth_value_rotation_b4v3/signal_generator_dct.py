@@ -19,6 +19,9 @@ import pandas as pd
 import numpy as np
 from pathlib import Path
 
+# L5事件日志(仅当params传l5_debug=True时填充; 研究诊断用)
+L5_DEBUG_LOG = []
+
 from params import (
     GROWTH_SYMBOL, VALUE_SYMBOL,
     BASELINE_PARAMS, INDEX_DATA_DIR,
@@ -269,7 +272,7 @@ def generate_signals(g_close, v_close, params=None):
     # 触发条件：持有成长 + rise_pct > min_rise(50%) + 5日动量转负
     # 基准锁定 = min(rise_days, 65)
     #
-    # 超级牛市(rise_pct>50%): 0.782→锁定减半, 0.9→立即解锁
+    # 超级牛市(rise_pct>50%): 0.782→锁定减半; 完全解锁仅靠新高试错或时间到期
     # 普通牛市(30%<rise_pct≤50%): 0.382→缩至一半, 0.618→完全解锁
     # ================================================================
     lookback_window = p.get('l5_lookback_window', 65)
@@ -299,6 +302,15 @@ def generate_signals(g_close, v_close, params=None):
     growth_trigger_low = None      # 触发时的Low价
     growth_trigger_peak_rise_pct = None  # 触发时的Peak/Low涨幅（区分大小牛市阶梯）
     growth_base_lock = 0           # 基准锁定天数
+    # l5_debug: 记录L5事件(触发/各路径解锁)到模块级L5_DEBUG_LOG供研究
+    l5_dbg = p.get('l5_debug', False)
+    if l5_dbg:
+        L5_DEBUG_LOG.clear()
+
+    def _dbg(evt, **kw):
+        if l5_dbg:
+            rec = dict(type=evt, date=str(index[kw['i']].date()), **{k: v for k, v in kw.items() if k != 'i'})
+            L5_DEBUG_LOG.append(rec)
 
     for i in range(n):
         current_price = g_close.iloc[i]
@@ -307,6 +319,8 @@ def generate_signals(g_close, v_close, params=None):
         if i < growth_locked_until and growth_trigger_peak is not None:
             # 路径A: 新高解锁（试错机制）
             if current_price > growth_trigger_peak:
+                _dbg('unlock_newhigh', i=i,
+                     days_held=i - growth_lock_start if growth_lock_start >= 0 else -1)
                 growth_locked_until = -1
                 growth_lock_start = -1
                 growth_trigger_peak = None
@@ -326,16 +340,13 @@ def generate_signals(g_close, v_close, params=None):
 
                 if peak_rise_pct > big_bull_thresh:
                     # === 超级大牛市(peak_rise_pct > 50%) ===
-                    if drawdown >= 0.9:
-                        # 回撤>=0.9 → 立即完全解锁
-                        growth_locked_until = -1
-                        growth_lock_start = -1
-                        growth_trigger_peak = None
-                        growth_trigger_low = None
-                        growth_trigger_peak_rise_pct = None
-                        growth_base_lock = 0
-                    elif drawdown >= 0.782:
+                    # 仅0.782减半一档; 完全解锁只靠新高试错(路径A)或时间到期。
+                    # 原"回撤>=0.9立即解锁"已删除: 13年从未触发(锁定期最大回撤0.872),
+                    # 且逻辑与L5使命相悖——崩得越深越该锁, 而非提前缴械。
+                    if drawdown >= 0.782:
                         # 回撤>=0.782 → 锁定时间减半（从触发日算起）
+                        _dbg('unlock_halve', i=i, drawdown=round(float(drawdown), 3),
+                             rise_pct=round(float(peak_rise_pct), 3))
                         new_lock_end = growth_lock_start + int(base_lock * 0.50)
                         if new_lock_end < growth_locked_until:
                             growth_locked_until = new_lock_end
@@ -370,6 +381,8 @@ def generate_signals(g_close, v_close, params=None):
             growth_lock_start = i
             growth_locked_until = i + growth_base_lock
             wt.iloc[i] = 0.0  # 当天清仓
+            _dbg('trigger', i=i, rise_pct=round(growth_trigger_peak_rise_pct, 3),
+                 rise_days=rise_days, base_lock=growth_base_lock)
 
     # ================================================================
     # 第8层: 黑天鹅保护 — 系统性风险（固定10日动量解锁）
