@@ -19,7 +19,7 @@ B4V9 = B4V8 默认配置 + 唯一参数改动 aw_flip_window: 20 → 35
   - DCD从6天优化至5天
   - L5超级牛市锁满全程（移除深度回撤提前解锁）
 """
-import os, base64, io, json, warnings, argparse, time
+import os, base64, io, json, warnings, argparse, time, shutil
 from datetime import datetime, timedelta, timezone
 
 BEIJING_TZ = timezone(timedelta(hours=8))
@@ -894,8 +894,8 @@ def make_html(signal, df, chart_b64, trades=None, params=None, nav_data=None, in
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
 <title>B4V9 · 每日信号 — Panda AI</title>
-<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-zoom@2.2.0/dist/chartjs-plugin-zoom.min.js"></script>
+<script src="assets/chart.umd.min.js"></script>
+<script src="assets/chartjs-plugin-zoom.min.js"></script>
 <style>
   * {{ margin: 0; padding: 0; box-sizing: border-box; }}
   body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "PingFang SC", "Microsoft YaHei", sans-serif;
@@ -1680,6 +1680,14 @@ def main():
     script_dir = os.path.dirname(os.path.abspath(__file__))
     out_dir = args.out_dir if args.out_dir else os.path.join(script_dir, 'docs')
     os.makedirs(out_dir, exist_ok=True)
+
+    # 图表库本地化：随页面一起发布，避免 jsdelivr CDN 在部分网络下不可达导致净值图空白
+    asset_src = os.path.join(script_dir, 'assets')
+    asset_dst = os.path.join(out_dir, 'assets')
+    os.makedirs(asset_dst, exist_ok=True)
+    for fname in ('chart.umd.min.js', 'chartjs-plugin-zoom.min.js'):
+        shutil.copyfile(os.path.join(asset_src, fname), os.path.join(asset_dst, fname))
+    print(f'  ✅ 图表库已复制: {asset_dst}')
 
     out_html = os.path.join(out_dir, 'index.html')
     with open(out_html, 'w', encoding='utf-8') as f:
