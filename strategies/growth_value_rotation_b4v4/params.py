@@ -54,7 +54,7 @@ BASELINE_PARAMS = dict(
 # ===== 回测参数 =====
 BACKTEST_CONFIG = dict(
     start_date="20130101",
-    end_date="20260824",
+    end_date="20261013",
     start_capital=1000000,     # 初始资金100万
     standard_symbol="480080.SZ",  # 基准指数（成长100，数据完整覆盖2012-2026）
     commission_rate=1,         # 费率档位1（ETF万一免五）

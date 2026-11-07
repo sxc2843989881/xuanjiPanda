@@ -225,9 +225,14 @@ def update_mongodb(index_symbol, merged_df, original_last_date):
     coll = db['index_daily_price']
 
     # 清除OHLC全相同的错误记录
+    # 注意: 2024-10-29 之前的历史行只有收盘价(open=high=low=close 属正常),
+    # 绝不能删; 仅清理真实OHLC时代(>=20241029)内的异常行。
+    REAL_OHLC_START = '20241029'
     all_docs = list(coll.find({'symbol': index_symbol}).sort('date', 1))
     bad_ids = []
     for doc in all_docs:
+        if str(doc.get('date', '')) < REAL_OHLC_START:
+            continue
         o, h, l, c = doc.get('open', 0), doc.get('high', 0), doc.get('low', 0), doc.get('close', 0)
         if o == h == l == c and o > 0:
             bad_ids.append(doc['_id'])
@@ -264,15 +269,18 @@ def update_mongodb(index_symbol, merged_df, original_last_date):
         if coll.count_documents({'symbol': index_symbol, 'date': date_str}) > 0:
             continue
 
+        # Mongo 引擎库统一使用「指数点/1000」量纲(历史惯例, 全序列必须一致),
+        # merged_df 为指数点量纲 → 写入前 /1000
+        _s = 1000.0
         record = {
             'symbol': index_symbol,
             'date': date_str,
             'trade_date': int(date_str),
-            'open': float(row.get('open', row['close'])),
-            'high': float(row.get('high', row['close'])),
-            'low': float(row.get('low', row['close'])),
-            'close': float(row['close']),
-            'last': float(row['close']),
+            'open': float(row.get('open', row['close'])) / _s,
+            'high': float(row.get('high', row['close'])) / _s,
+            'low': float(row.get('low', row['close'])) / _s,
+            'close': float(row['close']) / _s,
+            'last': float(row['close']) / _s,
             'volume': 999999999,  # 占位值，引擎要求 volume>0 才能成交订单
             'amount': 0,
             'limit_up': 999999,
