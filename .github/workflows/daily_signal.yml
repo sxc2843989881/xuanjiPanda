@@ -1,4 +1,4 @@
-name: B4V4 每日信号更新
+name: B4V9 每日信号更新
 
 on:
   schedule:
@@ -47,7 +47,7 @@ jobs:
           # 每次构建均为全新环境、无matplotlib字体缓存，generate.py首次运行会自动扫描到该字体
           sudo apt-get update && sudo apt-get install -y fonts-noto-cjk
 
-      - name: 生成B4V3信号页面
+      - name: 生成B4V9信号页面
         run: python signal_page_b4/generate.py
 
       - name: 上传 Pages 制品

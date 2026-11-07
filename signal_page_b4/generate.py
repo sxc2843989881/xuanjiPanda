@@ -1,18 +1,23 @@
-"""B4V4 成长价值轮动策略 — 每日信号生成器（L5锁满全程版）
+"""B4V9 成长价值轮动策略 — 每日信号生成器（B4V8基线 + AW窗口35）
 本脚本完全自包含，可直接在 GitHub Actions 上运行。
 依赖: pip install requests pandas numpy matplotlib
 
-B4V4 = B4V3 + L5超级牛市锁满全程（移除深度回撤提前解锁）
-官方引擎: 年化46.51% / Sharpe1.844 / 回撤-24.24% (vs B4V3 45.73%/1.806)
+B4V9 = B4V8 默认配置 + 唯一参数改动 aw_flip_window: 20 → 35
+有效策略层级 = B4V4(6层) + 第10层 AW反打脸保护(slow_dc) + 第11层 RCD轮动减仓(rot_z)
+  - 第10层 AW: 近35日T符号翻转>=5次判为震荡态, 震荡态内换向确认门槛 5天→7天,
+    削减低质量"来回切"换向; fw=35 比 fw=20 判定更严格, 仅在真震荡时加严
+  - 第11层 RCD: 持有腿波动率标准化急跌(<=-1.6σ)且相对另一腿超额<=-4%且另一腿上涨
+    (资金轮动型急跌)时, 仓位减半; 持有腿止跌回升或方向切换后回补
+官方引擎(截至2026-10-13): 年化45.77% / Calmar2.08 / 最大回撤-22.03%
+  (vs B4V4口径 fw20: 45.48% / 1.88 / -24.18%)
 
-改进点：
-  - L5超级牛市(涨幅>50%)触发锁定后锁满全程, 移除"回撤>=0.782减半"提前解锁:
-    深度回撤后的反弹快而不持久, 动量/DC确认时已处高位
+继承自B4V4：
   - 信号与收益计算与官方引擎同源：使用成长100(480080)/价值100(480081)指数，
     数据来自 cnindex.com.cn 官网（同 update_data_latest.py 数据源）
   - 收盘价撮合（matching_type=0）：读昨日信号，今日收盘价成交
   - DC容差机制（dc_tolerance=0.09）：连续dc天中允许1天反向但|T|<=0.09
   - DCD从6天优化至5天
+  - L5超级牛市锁满全程（移除深度回撤提前解锁）
 """
 import os, base64, io, json, warnings, argparse, time
 from datetime import datetime, timedelta, timezone
@@ -52,7 +57,7 @@ plt.rcParams['axes.unicode_minus'] = False
 
 warnings.filterwarnings('ignore')
 
-# ========== B4V4策略配置 ==========
+# ========== B4V9策略配置 ==========
 # 信号与收益计算统一使用官方引擎同源指数：成长100(480080)/价值100(480081)
 CODE_G = '480080'     # 成长100指数（策略信号基准）
 CODE_V = '480081'     # 价值100指数（策略信号基准）
@@ -65,7 +70,7 @@ GROWTH_ETF_NAME = '易方达成长ETF'
 VALUE_ETF_NAME = '易方达价值ETF'
 FETCH_START = '2012-01-01'   # 拉取起始日期（覆盖官方引擎2013起全量回测）
 
-# B4V4策略核心参数（与 strategies/growth_value_rotation_b4v4/params.py BASELINE_PARAMS 一致）
+# B4V9策略核心参数（与 strategies/growth_value_rotation_b4v9/params.py BASELINE_PARAMS 一致）
 B4_PARAMS = dict(
     dc=5,                # 方向确认天数
     dc_tolerance=0.09,   # DC容差：连续dc天中允许1天反向但|T|<=0.09，仍算一致
@@ -83,6 +88,26 @@ B4_PARAMS = dict(
     black_swan_v_thresh=0.03,
     black_swan_lookback=5,
     momentum_period=10,
+    # 第10层：反打脸保护 AW（slow_dc）—— B4V9 唯一改动：aw_flip_window 20→35
+    aw_mode='slow_dc',            # 生产固定 slow_dc；'none' 可关闭回退 B4V4 行为
+    aw_flip_window=35,           # 震荡态检测窗口：近35日T符号翻转次数（B4V4口径为20）
+    aw_flip_thresh=5,            # 翻转次数阈值：>=5 判为震荡态
+    aw_anchor_window=60,         # 慢锚均线窗口（预热不足的早期区间不判震荡）
+    aw_dc_strict=7,              # 震荡态内新方向需连续确认7天（=dc+2）
+    aw_t_gate=1.0,               # tgate 模式预留（生产不走该模式）
+    # 第11层：单腿急跌·轮动减仓 RCD（rot_z 波动率标准化）
+    dr_mode='rot_z',             # 'none' 可关闭；rot_z=波动率标准化触发
+    dr_drop=0.06,                # rot 模式：持有腿5日跌幅阈值
+    dr_z=1.6,                    # rot_z：持有腿5日跌幅 <= -1.6σ 触发
+    dr_spread=0.04,              # 相对另一腿5日超额 <= -4%
+    dr_other_up=True,            # 要求另一腿5日上涨（资金轮动型，规避普跌反弹踏空）
+    dr_scale=0.5,                # 触发后仓位减半
+    dr_rec=0.0,                  # 持有腿5日收益回正即恢复满仓
+    dr_rec_win=5,                # 恢复判定窗口：5日
+    dr_deep=False,               # 深度档默认关闭
+    dr_drop20=0.12,
+    dr_spread20=0.05,
+    dr_deep_scale=0.0,
 )
 
 
@@ -306,7 +331,7 @@ def _etf_fallback_fill(cached_df, code, name):
     return combined.set_index('date')['close']
 
 
-# ========== B4V4 辅助函数 ==========
+# ========== B4V9 辅助函数 ==========
 def _calc_low_peak_rise(g_close, lookback_window):
     """预计算每个交易日的Low、Peak、peak_rise_pct、current_rise_pct、rise_days
 
@@ -350,18 +375,19 @@ def _calc_low_peak_rise(g_close, lookback_window):
     return low_series, peak_series, peak_rise_pct_series, current_rise_pct_series, rise_days_series
 
 
-# ========== B4V4 6层信号计算 ==========
+# ========== B4V9 信号计算（B4V4 6层 + 第10层AW + 第11层RCD） ==========
 def compute_signals(g_close, v_close, params):
-    """B4V4 6层信号计算（L5锁满全程版）
+    """B4V9 信号计算（B4V8默认基线 + aw_flip_window=35）
 
-    B4V4 = B4V3 + L5超级牛市锁满全程（移除深度回撤提前解锁）
-
+    有效层级：
     第1层 DC   — 方向确认：T值方向需连续 dc 天一致才确认（容差允许1天反向|T|<=dc_tolerance）
     第2层 DCD  — 方向冷却：换向后需等 dcd 天才允许再次换向
+    第10层 AW  — 反打脸保护：近35日T翻转>=5次的震荡态内，换向确认 5天→7天
     第3层 弱信号 — T弱+斜率弱 → 空仓
     第4层 BIAS — 超买保护：偏离MA20>bias_high → 清仓
     第5层 牛市止损 — 超级牛市锁满全程; 新高试错或时间到期解锁
     第8层 黑天鹅保护 — 固定10日动量解锁
+    第11层 RCD — 轮动型单腿急跌(波动率标准化<=-1.6σ)时仓位减半，止跌回补
     """
     # 比价 = 成长/价值
     ratio = g_close / v_close
@@ -422,6 +448,43 @@ def compute_signals(g_close, v_close, params):
         else:
             new_dir.iloc[i] = prev
     dir_raw = new_dir.ffill().fillna('growth')
+
+    # ===== L10: 反打脸保护 (AW — Anti-Whipsaw) =====
+    # 震荡态检测: 近 aw_flip_window 日 T 符号翻转次数 >= aw_flip_thresh → 震荡态。
+    # slow_dc 动作: 震荡态内换向需新方向连续 aw_dc_strict(=7) 天确认（正常 dc=5），
+    # 非震荡态行为完全不变。慢均线预热不足的早期区间不判震荡。
+    # 与 strategies/growth_value_rotation_b4v9/signal_generator_dct.py 同源（标签 growth/value）。
+    aw_mode = params.get('aw_mode', 'none')
+    aw_whipsaw_flag = np.zeros(n, dtype=bool)
+    if aw_mode != 'none':
+        _sgn = np.sign(t)
+        _flip = ((_sgn != _sgn.shift(1)) & (_sgn != 0) & (_sgn.shift(1) != 0)).astype(float)
+        flip_w = _flip.rolling(params.get('aw_flip_window', 20)).sum()
+        _anchor_ma = ratio.rolling(params.get('aw_anchor_window', 60)).mean()
+        whipsaw = (flip_w >= params.get('aw_flip_thresh', 5)) & _anchor_ma.notna()
+        aw_whipsaw_flag = whipsaw.fillna(False).values
+        dc_strict = params.get('aw_dc_strict', 7)
+        _raw_arr = raw_dir.values
+
+        aw_dir = dir_raw.copy()
+        prev = aw_dir.iloc[0]
+        for i in range(1, n):
+            cand = dir_raw.iloc[i]
+            if whipsaw.iloc[i]:
+                if cand == prev:
+                    aw_dir.iloc[i] = cand
+                else:
+                    allow = False
+                    if aw_mode == 'slow_dc':
+                        k = int(dc_strict)
+                        s = max(0, i - k + 1)
+                        allow = (_raw_arr[s:i + 1] == cand).all()
+                    aw_dir.iloc[i] = cand if allow else prev
+            else:
+                aw_dir.iloc[i] = cand
+            prev = aw_dir.iloc[i]
+        dir_raw = aw_dir
+
     dir_series = dir_raw.map({'growth': 'growth', 'value': 'value'})
 
     # 权重初始为1.0
@@ -560,6 +623,70 @@ def compute_signals(g_close, v_close, params):
             value_locked = True
             wt.iloc[i] = 0.0
 
+    # ===== L11: 单腿急跌·轮动减仓 (RCD — Rotation-Confirmed De-risk) =====
+    # 仅"资金轮动型"急跌减仓: 持有腿波动率标准化急跌 + 相对另一腿显著走弱 + 另一腿上涨。
+    # 普跌型(两腿同跌)不干预, 交给L8清仓与V型反弹, 避免反弹中踏空。
+    # 动作: 触发后 wt *= dr_scale(半仓); 持有腿止跌回升(dr_rec)或方向切换后回补。
+    # 与 strategies/growth_value_rotation_b4v9/signal_generator_dct.py 同源。
+    dr_mode = params.get('dr_mode', 'none')
+    rcd_flag = np.zeros(n, dtype=bool)
+    if dr_mode != 'none':
+        dr_drop = params.get('dr_drop', 0.06)
+        dr_z = params.get('dr_z', 1.5)
+        dr_spread = params.get('dr_spread', 0.04)
+        dr_other_up = params.get('dr_other_up', True)
+        dr_scale = params.get('dr_scale', 0.5)
+        dr_rec = params.get('dr_rec', 0.0)
+        dr_rec_win = params.get('dr_rec_win', 5)
+        dr_deep = params.get('dr_deep', False)
+        dr_drop20 = params.get('dr_drop20', 0.12)
+        dr_spread20 = params.get('dr_spread20', 0.05)
+        dr_deep_scale = params.get('dr_deep_scale', 0.0)
+
+        g_r5_dr = g_close / g_close.shift(5) - 1
+        v_r5_dr = v_close / v_close.shift(5) - 1
+        g_r20_dr = g_close / g_close.shift(20) - 1
+        v_r20_dr = v_close / v_close.shift(20) - 1
+        g_s20_dr = g_close.pct_change().rolling(20).std()
+        v_s20_dr = v_close.pct_change().rolling(20).std()
+
+        is_g = (dir_series == 'growth').values
+        held_r5 = np.where(is_g, g_r5_dr.values, v_r5_dr.values)
+        other_r5 = np.where(is_g, v_r5_dr.values, g_r5_dr.values)
+        held_r20 = np.where(is_g, g_r20_dr.values, v_r20_dr.values)
+        other_r20 = np.where(is_g, v_r20_dr.values, g_r20_dr.values)
+        held_s20 = np.where(is_g, g_s20_dr.values, v_s20_dr.values)
+        spread5 = held_r5 - other_r5
+        spread20 = held_r20 - other_r20
+        held_rec = held_r20 if dr_rec_win >= 20 else held_r5
+        # 波动率标准化跌幅: 持有腿5日收益 / (20日已实现波动 × √5)
+        z5 = held_r5 / (held_s20 * np.sqrt(5))
+
+        if dr_mode == 'rot_z':
+            drop_ok = z5 <= -dr_z
+        else:
+            drop_ok = held_r5 <= -dr_drop
+        spread_ok = spread5 <= -dr_spread
+        rot_ok = (other_r5 > 0) if dr_other_up else np.ones(n, dtype=bool)
+        trig = np.nan_to_num(drop_ok & spread_ok & rot_ok).astype(bool)
+
+        derisk = False
+        prev_dir_dr = None
+        for i in range(n):
+            if dir_series.iloc[i] != prev_dir_dr:
+                derisk = False
+                prev_dir_dr = dir_series.iloc[i]
+            if trig[i]:
+                derisk = True
+            elif derisk and held_rec[i] >= dr_rec:
+                derisk = False
+            if derisk and wt.iloc[i] > 0.001:
+                sc = dr_scale
+                if dr_deep and held_r20[i] <= -dr_drop20 and spread20[i] <= -dr_spread20:
+                    sc = dr_deep_scale
+                wt.iloc[i] = wt.iloc[i] * sc
+                rcd_flag[i] = True
+
     # 构建明细 DataFrame
     df = pd.DataFrame(index=index)
     df['ratio'] = ratio
@@ -577,6 +704,8 @@ def compute_signals(g_close, v_close, params):
     df['v_dd20'] = v_close.pct_change(20)
     df['is_weak'] = is_weak
     df['l5_lock'] = l5_lock_flag
+    df['aw_whipsaw'] = aw_whipsaw_flag
+    df['rcd_derisk'] = rcd_flag
     return df
 
 
@@ -692,7 +821,8 @@ def make_html(signal, df, chart_b64, trades=None, params=None, nav_data=None, in
     v_days = (recent['dir'] == 'value').sum()
     c_days = n - g_days - v_days
 
-    version_info = (f'B4V4(指数同源·L5锁满全程) · 成长100/价值100 · '
+    version_info = (f'B4V9(指数同源·AW反打脸fw{p.get("aw_flip_window", 35)}+RCD轮动减仓) · '
+                    f'成长100/价值100 · '
                     f'DC={p["dc"]} 容差={p.get("dc_tolerance", 0)} DCD={p["dcd"]} '
                     f'动量={p["momentum_period"]}日 窗口={p.get("l5_lookback_window", 65)}日')
     t60_mean = df['T'].tail(60).abs().mean()
@@ -763,7 +893,7 @@ def make_html(signal, df, chart_b64, trades=None, params=None, nav_data=None, in
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-<title>B4V4 · 每日信号 — Panda AI</title>
+<title>B4V9 · 每日信号 — Panda AI</title>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-zoom@2.2.0/dist/chartjs-plugin-zoom.min.js"></script>
 <style>
@@ -861,7 +991,7 @@ def make_html(signal, df, chart_b64, trades=None, params=None, nav_data=None, in
 <div class="container">
   <div class="header">
     <div>
-      <h1>⚡ B4V4 · Panda AI</h1>
+      <h1>⚡ B4V9 · Panda AI</h1>
       <div class="sub">{version_info}</div>
     </div>
     <div class="date">{beijing_now().strftime('%Y-%m-%d<br>%H:%M')}</div>
@@ -886,7 +1016,7 @@ def make_html(signal, df, chart_b64, trades=None, params=None, nav_data=None, in
         <div class="row"><span class="label">比价偏离MA20</span>
           <span class="value">{latest['dev_pct']:+.2f}%</span></div>
         <div class="row"><span class="label">策略版本</span>
-          <span class="value">B4V4 (6层 · L5锁满全程 + 收盘价撮合 + DC容差)</span></div>
+          <span class="value">B4V9 (AW反打脸fw35 + RCD轮动减仓 + L5锁满全程 + DC容差)</span></div>
       </div>
     </div>
   </div>
@@ -925,7 +1055,7 @@ def make_html(signal, df, chart_b64, trades=None, params=None, nav_data=None, in
   </div>
 
   <div class="charts">
-    <img src="data:image/png;base64,{chart_b64}" alt="B4V4信号图表">
+    <img src="data:image/png;base64,{chart_b64}" alt="B4V9信号图表">
   </div>
 
   <div class="grid">
@@ -1001,10 +1131,11 @@ def make_html(signal, df, chart_b64, trades=None, params=None, nav_data=None, in
   </div>
 
   <div class="footer">
-    B4V4 · 成长价值轮动策略（L5锁满全程 · 指数同源）<br>
+    B4V9 · 成长价值轮动策略（L5锁满全程 · AW反打脸 · RCD轮动减仓 · 指数同源）<br>
     信号基准: 成长100(480080)/价值100(480081) · 收益按指数收盘价计<br>
     实盘通道: 易方达成长ETF(159259)/易方达价值ETF(159263)<br>
     参数: DC={p["dc"]} 容差={p.get("dc_tolerance", 0)} DCD={p["dcd"]} rt={p["rt"]} BIAS={p["bias_high"]} 动量={p["momentum_period"]}日<br>
+    第10层 AW: 反打脸保护(近{p.get("aw_flip_window", 35)}日T翻转≥{p.get("aw_flip_thresh", 5)}次判震荡, 确认{p["dc"]}→{p.get("aw_dc_strict", 7)}天) · 第11层 RCD: 轮动型急跌减仓至{p.get("dr_scale", 0.5)*100:.0f}%<br>
     第5层: 牛市止损(超级牛市锁满全程; 新高试错或时间到期解锁) · 第8层: 黑天鹅保护(固定10日动量解锁)<br>
     数据来源: cnindex.com.cn · 自动生成于 {beijing_now().strftime('%Y-%m-%d %H:%M')}<br>
     ⚠️ 仅供参考，不构成投资建议
@@ -1421,18 +1552,19 @@ document.getElementById('btn-all').classList.add('active');
 
 # ========== 主流程 ==========
 def main():
-    parser = argparse.ArgumentParser(description='B4V4 每日信号生成器 — Panda AI')
+    parser = argparse.ArgumentParser(description='B4V9 每日信号生成器 — Panda AI')
     parser.add_argument('--out-dir', type=str, default=None,
                         help='输出目录，默认 signal_page_b4/docs/')
     args = parser.parse_args()
 
     print('=' * 50)
-    print('  ⚡ B4V4 (6层) 每日信号生成器')
+    print('  ⚡ B4V9 (AW反打脸 + RCD轮动减仓) 每日信号生成器')
     print(f'  {beijing_now().strftime("%Y-%m-%d %H:%M")}')
-    print(f'  策略版本: B4V4 (B4V3 + L5超级牛市锁满全程)')
+    print(f'  策略版本: B4V9 (B4V8默认基线 + aw_flip_window 20→35)')
     print(f'  参数: DC={B4_PARAMS["dc"]} DCD={B4_PARAMS["dcd"]} '
           f'rt={B4_PARAMS["rt"]} 动量={B4_PARAMS["momentum_period"]}日 '
-          f'窗口={B4_PARAMS.get("l5_lookback_window", 65)}日')
+          f'AW={B4_PARAMS.get("aw_mode")}/fw{B4_PARAMS.get("aw_flip_window")} '
+          f'RCD={B4_PARAMS.get("dr_mode")}/z{B4_PARAMS.get("dr_z")}')
     print('=' * 50)
 
     # 1. 获取数据（cnindex官网指数，本地缓存，每天仅增量拉取）
@@ -1443,8 +1575,8 @@ def main():
     g, v = g[common], v[common]
     print(f'  共同交易日: {len(g)}天 ({g.index[0].date()} ~ {g.index[-1].date()})')
 
-    # 2. 计算信号（B4V4 6层逻辑）
-    print('\n🧮 计算信号 (B4V4 6层逻辑)...')
+    # 2. 计算信号（B4V9：B4V4 6层 + 第10层AW + 第11层RCD）
+    print('\n🧮 计算信号 (B4V9 AW+RCD 逻辑)...')
     df = compute_signals(g, v, B4_PARAMS)
 
     # 2.5 计算P&L净值（与官方引擎同源：基于指数收盘价）
@@ -1557,7 +1689,7 @@ def main():
     # JSON信号输出
     signal_json = {
         'generated_at': beijing_now().strftime('%Y-%m-%d %H:%M:%S'),
-        'strategy': 'B4V4 (6层 · L5锁满全程 · 指数同源)',
+        'strategy': 'B4V9 (AW反打脸fw35 + RCD轮动减仓 + L5锁满全程 · 指数同源)',
         'params': B4_PARAMS,
         'latest_signal': {
             'date': df.index[-1].strftime('%Y-%m-%d'),
